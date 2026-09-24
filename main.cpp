@@ -33,6 +33,15 @@ private:
 
     unordered_set<ull> used_ids;
 
+    struct OrderLocation {
+        Side side;
+        ll price;
+        list<Order>::iterator position;
+    };
+
+    // Only orders currently resting in the book belong here.
+    unordered_map<ull, OrderLocation> active_orders;
+
     void matchBuy(Order& incoming, vector<Trade>& trades) {
         while (incoming.remaining_qty > 0 && !asks.empty()) {
             auto it = asks.begin();
@@ -59,6 +68,7 @@ private:
             resting.remaining_qty -= qty;
 
             if (resting.remaining_qty == 0) {
+                active_orders.erase(resting.id);
                 it->second.pop_front();
             }
 
@@ -68,7 +78,11 @@ private:
         }
 
         if (incoming.remaining_qty > 0) {
-            bids[incoming.price].push_back(incoming);
+            auto& orders = bids[incoming.price];
+            orders.push_back(incoming);
+            active_orders.emplace(incoming.id, OrderLocation{
+                incoming.side, incoming.price, prev(orders.end())
+            });
         }
     }
 
@@ -98,6 +112,7 @@ private:
             resting.remaining_qty -= qty;
 
             if (resting.remaining_qty == 0) {
+                active_orders.erase(resting.id);
                 it->second.pop_front();
             }
 
@@ -107,11 +122,49 @@ private:
         }
 
         if (incoming.remaining_qty > 0) {
-            asks[incoming.price].push_back(incoming);
+            auto& orders = asks[incoming.price];
+            orders.push_back(incoming);
+            active_orders.emplace(incoming.id, OrderLocation{
+                incoming.side, incoming.price, prev(orders.end())
+            });
         }
     }
 
 public:
+    OrderBook() = default;
+
+    // Copying would leave the index pointing into the original book.
+    OrderBook(const OrderBook&) = delete;
+    OrderBook& operator=(const OrderBook&) = delete;
+    OrderBook(OrderBook&&) = delete;
+    OrderBook& operator=(OrderBook&&) = delete;
+
+    bool cancelOrder(ull id) {
+        auto found = active_orders.find(id);
+        if (found == active_orders.end()) {
+            return false;
+        }
+
+        const OrderLocation& location = found->second;
+        if (location.side == Side::Buy) {
+            auto level = bids.find(location.price);
+            level->second.erase(location.position);
+            if (level->second.empty()) {
+                bids.erase(level);
+            }
+        } else {
+            auto level = asks.find(location.price);
+            level->second.erase(location.position);
+            if (level->second.empty()) {
+                asks.erase(level);
+            }
+        }
+
+        active_orders.erase(found);
+        // Keep used_ids unchanged: cancelled IDs cannot be reused.
+        return true;
+    }
+
     vector<Trade> addOrder(Order incoming) {
         if (incoming.price <= 0 || incoming.remaining_qty <= 0) {
             throw invalid_argument(
@@ -176,6 +229,7 @@ int main() {
         cout << "\nCommands:\n"
              << "BUY id price quantity\n"
              << "SELL id price quantity\n"
+             << "CANCEL id\n"
              << "BOOK\n"
              << "HELP\n"
              << "EXIT\n"
@@ -264,6 +318,20 @@ int main() {
 
                 cout << "Filled: " << filled
                      << " | Resting: " << qty - filled << '\n';
+            }
+            else if (command == "CANCEL") {
+                string idText, extra;
+                if (!(ss >> idText) || (ss >> extra)) {
+                    cout << "Usage: CANCEL id\n";
+                    continue;
+                }
+
+                ull id = static_cast<ull>(parsePositive(idText));
+                if (book.cancelOrder(id)) {
+                    cout << "CANCELLED order " << id << '\n';
+                } else {
+                    cout << "REJECTED: no active order with ID " << id << '\n';
+                }
             }
             else if (command == "BOOK" ||
                      command == "HELP" ||
