@@ -139,6 +139,29 @@ public:
     OrderBook(OrderBook&&) = delete;
     OrderBook& operator=(OrderBook&&) = delete;
 
+    optional<ll> bestBid() const {
+        if (bids.empty()) {
+            return nullopt;
+        }
+        return bids.begin()->first;
+    }
+
+    optional<ll> bestAsk() const {
+        if (asks.empty()) {
+            return nullopt;
+        }
+        return asks.begin()->first;
+    }
+
+    optional<ll> spread() const {
+        const auto bid = bestBid();
+        const auto ask = bestAsk();
+        if (!bid || !ask) {
+            return nullopt;
+        }
+        return *ask - *bid;
+    }
+
     bool cancelOrder(ull id) {
         auto found = active_orders.find(id);
         if (found == active_orders.end()) {
@@ -231,6 +254,7 @@ int main() {
              << "SELL id price quantity\n"
              << "CANCEL id\n"
              << "BOOK\n"
+             << "QUOTE\n"
              << "HELP\n"
              << "EXIT\n"
              << "Prices are in paise: Rs 100 = 10000\n\n";
@@ -334,6 +358,7 @@ int main() {
                 }
             }
             else if (command == "BOOK" ||
+                     command == "QUOTE" ||
                      command == "HELP" ||
                      command == "EXIT") {
                 string extra;
@@ -345,6 +370,15 @@ int main() {
 
                 if (command == "BOOK") {
                     book.printBook();
+                }
+                else if (command == "QUOTE") {
+                    const auto bid = book.bestBid();
+                    const auto ask = book.bestAsk();
+                    const auto spread = book.spread();
+                    cout << "QUOTE (prices in paise)\n"
+                         << "Best bid: " << (bid ? to_string(*bid) : "N/A") << '\n'
+                         << "Best ask: " << (ask ? to_string(*ask) : "N/A") << '\n'
+                         << "Spread: " << (spread ? to_string(*spread) : "N/A") << '\n';
                 }
                 else if (command == "HELP") {
                     printHelp();
