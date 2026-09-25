@@ -2,3 +2,4 @@ trading_engine
 *.exe
 *.o
 build/
+tests
