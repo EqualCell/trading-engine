@@ -3,3 +3,5 @@ trading_engine
 *.o
 build/
 tests
+
+benchmark
