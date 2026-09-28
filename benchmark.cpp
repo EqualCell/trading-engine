@@ -36,15 +36,14 @@ BenchmarkOperation cancel(ull id) {
     return {OperationType::Cancel, {}, id};
 }
 
-std::size_t parseCount(int argc, char* argv[]) {
-    if (argc > 2) {
-        throw std::invalid_argument("usage: ./benchmark [positive operation count]");
-    }
-    if (argc == 1) {
-        return 200000;
-    }
+enum class Scenario { All, Resting, Aggressive, Mixed };
 
-    const std::string text = argv[1];
+struct Options {
+    Scenario scenario;
+    std::size_t count;
+};
+
+std::size_t parseCount(const std::string& text) {
     std::size_t count = 0;
     const auto result = std::from_chars(text.data(), text.data() + text.size(), count);
     if (text.empty() || result.ec != std::errc{} ||
@@ -58,6 +57,26 @@ std::size_t parseCount(int argc, char* argv[]) {
         throw std::invalid_argument("operation count is too large");
     }
     return count;
+}
+
+Options parseOptions(int argc, char* argv[]) {
+    if (argc > 3) {
+        throw std::invalid_argument("too many arguments");
+    }
+
+    Scenario scenario = Scenario::All;
+    int count_argument = 1;
+    if (argc > 1) {
+        const std::string name = argv[1];
+        if (name == "all") scenario = Scenario::All;
+        else if (name == "resting") scenario = Scenario::Resting;
+        else if (name == "aggressive") scenario = Scenario::Aggressive;
+        else if (name == "mixed") scenario = Scenario::Mixed;
+        else if (argc == 3) throw std::invalid_argument("unknown scenario: " + name);
+        else return {Scenario::All, parseCount(name)};
+        count_argument = 2;
+    }
+    return {scenario, argc > count_argument ? parseCount(argv[count_argument]) : 200000};
 }
 
 std::vector<BenchmarkOperation> makeRestingOperations(std::size_t count) {
@@ -184,10 +203,11 @@ void warmUp() {
 
 int main(int argc, char* argv[]) {
     try {
-        const std::size_t count = parseCount(argc, argv);
+        const Options options = parseOptions(argc, argv);
+        const std::size_t count = options.count;
         warmUp();
 
-        {
+        if (options.scenario == Scenario::All || options.scenario == Scenario::Resting) {
             const auto operations = makeRestingOperations(count);
             OrderBook book;
             const auto result = measure("Resting-order insertion", book, operations);
@@ -196,7 +216,7 @@ int main(int argc, char* argv[]) {
             }
             printResult(result);
         }
-        {
+        if (options.scenario == Scenario::All || options.scenario == Scenario::Aggressive) {
             const auto workload = makeMatchingWorkload(count);
             OrderBook book;
             for (const Order& order : workload.initial_orders) {
@@ -212,12 +232,16 @@ int main(int argc, char* argv[]) {
             }
             printResult(result);
         }
-        {
+        if (options.scenario == Scenario::All || options.scenario == Scenario::Mixed) {
             const auto operations = makeMixedOperations(count);
             OrderBook book;
             printResult(measure("Mixed workload", book, operations));
         }
         return 0;
+    } catch (const std::invalid_argument& error) {
+        std::cerr << "Benchmark error: " << error.what() << '\n'
+                  << "Usage: ./benchmark [all|resting|aggressive|mixed] [positive operation count]\n";
+        return 1;
     } catch (const std::exception& error) {
         std::cerr << "Benchmark error: " << error.what() << '\n';
         return 1;
