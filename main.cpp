@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -44,6 +46,25 @@ ll parsePositive(const string& s) {
     ll value = stoll(s);
     if (value <= 0) {
         throw invalid_argument("Numbers must be positive");
+    }
+    return value;
+}
+
+// Replay time permits zero and the full uint64_t range, unlike order fields.
+uint64_t parseTimestamp(const string& text) {
+    if (text.empty()) {
+        throw invalid_argument("missing timestamp");
+    }
+    uint64_t value = 0;
+    for (char digit : text) {
+        if (digit < '0' || digit > '9') {
+            throw invalid_argument("invalid timestamp");
+        }
+        const uint64_t next = static_cast<uint64_t>(digit - '0');
+        if (value > (numeric_limits<uint64_t>::max() - next) / 10) {
+            throw invalid_argument("timestamp is too large");
+        }
+        value = value * 10 + next;
     }
     return value;
 }
@@ -150,35 +171,75 @@ bool processLine(const string& line, OrderBook& book, ReplayStats& stats,
     return false;
 }
 
-void printSummary(const ReplayStats& stats) {
+void printSummary(const ReplayStats& stats, bool timed = false,
+                  optional<uint64_t> final_time = nullopt) {
     cout << "Replay summary:\n"
          << "Accepted orders: " << stats.accepted_orders << '\n'
          << "Rejected commands: " << stats.rejected_commands << '\n'
          << "Trades: " << stats.trades << '\n'
          << "Traded quantity: " << stats.traded_quantity << '\n'
          << "Successful cancellations: " << stats.successful_cancellations << '\n';
+    if (timed) {
+        cout << "Final timestamp (us): "
+             << (final_time ? to_string(*final_time) : "N/A") << '\n';
+    }
 }
 
 int main(int argc, char* argv[]) {
     const bool replay = argc == 3 && string(argv[1]) == "--replay" && argv[2][0] != '\0';
-    if (argc != 1 && !replay) {
-        cerr << "Usage: " << argv[0] << " [--replay filename]\n";
+    const bool timed = argc == 3 && string(argv[1]) == "--replay-timed" && argv[2][0] != '\0';
+    if (argc != 1 && !replay && !timed) {
+        cerr << "Usage: " << argv[0] << " [--replay filename | --replay-timed filename]\n";
         return 1;
     }
 
     OrderBook book;
     ReplayStats stats;
     string line;
-    if (replay) {
+    if (replay || timed) {
         ifstream input(argv[2]);
         if (!input) {
             cerr << "Cannot open replay file: " << argv[2] << '\n';
             return 1;
         }
         size_t line_number = 0;
+        optional<uint64_t> simulation_time;
         while (getline(input, line)) {
             ++line_number;
-            if (processLine(line, book, stats, true, line_number)) {
+            if (timed) {
+                if (line.find_first_not_of(" \t\r\n\v\f") == string::npos) {
+                    continue;
+                }
+                stringstream fields(line);
+                string timestamp_text, command;
+                fields >> timestamp_text;
+                auto reject_time = [&](const string& reason) {
+                    ++stats.rejected_commands;
+                    cout << "Line " << line_number << ": " << reason << '\n';
+                };
+                uint64_t timestamp;
+                try {
+                    timestamp = parseTimestamp(timestamp_text);
+                } catch (const invalid_argument& error) {
+                    reject_time(error.what());
+                    continue;
+                }
+                if (!(fields >> command)) {
+                    reject_time("missing command");
+                    continue;
+                }
+                if (simulation_time && timestamp < *simulation_time) {
+                    reject_time("timestamp goes backward");
+                    continue;
+                }
+                string arguments;
+                getline(fields, arguments);
+                simulation_time = timestamp;
+                cout << "Time (us): " << timestamp << '\n';
+                if (processLine(command + arguments, book, stats, true, line_number)) {
+                    break;
+                }
+            } else if (processLine(line, book, stats, true, line_number)) {
                 break;
             }
         }
@@ -186,7 +247,7 @@ int main(int argc, char* argv[]) {
             cerr << "Error reading replay file: " << argv[2] << '\n';
             return 1;
         }
-        printSummary(stats);
+        printSummary(stats, timed, simulation_time);
         return stats.rejected_commands == 0 ? 0 : 1;
     }
 
