@@ -122,3 +122,69 @@ el('scenario').value = 'spread-capture'; await el('scenario').fire('change'); aw
 el('scenario').value = 'imported'; await el('scenario').fire('change');
 assert.equal(el('description').textContent, imported.description, 'Switching back must restore uploaded data');
 console.log('PASS: frontend schema, exact formatting, controls, synchronized panels, quote gaps, and invalid imports (DOM fixture; not browser QA)');
+
+// Optional actual historical-session checks. The ignored dataset is never needed
+// for normal synthetic-mode unit tests; pass its export path after downloading.
+if (process.argv[2]) {
+  const { validateHistorical, indexHistorical, bookAt, prefixCount, historicalPlot, metric, marketPrice, utc } = await import('./dashboard/historical.js');
+  const data = JSON.parse(await readFile(process.argv[2], 'utf8'));
+  validateHistorical(data);
+  const index = indexHistorical(data), firstSnapshot = data.events.findIndex((event) => event.type === 'snapshot');
+  assert(firstSnapshot > 0, 'Actual window must have trades before the first snapshot');
+  assert.equal(bookAt(data, index, 0), null, 'No future book at first trade');
+  for (let i = 1; i < data.events.length; ++i) if (data.events[i].type === 'trade')
+    assert.equal(bookAt(data, index, i), bookAt(data, index, i - 1), 'Trade must not mutate observed depth');
+  assert.equal(utc('1704067200002133'), '2024-01-01T00:00:00.002133Z');
+  assert.equal(marketPrice('100000000005'), '100.000000005 USDT');
+  assert.equal(prefixCount(index.tradePositions, 0), 1);
+  const plot = historicalPlot(data, index, data.events.length - 1);
+  assert(plot.length < 600, 'Actual chart should be sampled, without dropping playback events');
+  assert(plot[0].book === null, 'Initial unavailable depth must remain a chart gap');
+  for (const mutate of [
+    (d) => { d.schema_version = 2; },
+    (d) => { d.instrument.market = 'futures'; },
+    (d) => { d.units.price = 'USD'; },
+    (d) => { d.events[0].trade.amount = '0.000000001'; },
+    (d) => { d.events[0].trade.price = 42283.59; },
+    (d) => { d.events[0].timestamp_us = '1704067199999999'; },
+    (d) => { d.events[firstSnapshot].snapshot.midpoint = '1'; },
+  ]) { const bad = structuredClone(data); mutate(bad); assert.throws(() => validateHistorical(bad)); }
+  el('upload').files = [{ size: 1, text: async () => JSON.stringify(data) }];
+  await el('upload').fire('change');
+  assert.equal(el('synthetic-metrics').hidden, true);
+  assert.equal(el('historical-metrics').hidden, false);
+  assert.equal(el('historical-notes').hidden, false);
+  assert.match(el('historical-notes').textContent, /14 exchange timestamps/);
+  assert.equal(el('historical-bid').textContent, 'Unavailable');
+  assert.equal(el('historical-depth').children.length, 0);
+  assert.equal(el('historical-trades').children.length, 1);
+  assert.equal(el('historical-time').textContent, utc(data.events[0].timestamp_us));
+  el('timeline').value = String(firstSnapshot); await el('timeline').fire('input');
+  assert.equal(el('historical-depth').children.length, 5);
+  const source = data.events[firstSnapshot].snapshot;
+  assert.equal(el('historical-bid').textContent, marketPrice(metric(source, 'best_bid')));
+  assert.equal(el('historical-depth').children[0].children[1].textContent, source.bids[0].amount);
+  const tapeBefore = prefixCount(index.tradePositions, firstSnapshot);
+  assert.equal(el('historical-trades').children.length, Math.min(100, tapeBefore));
+  el('timeline').value = String(data.events.length - 1); await el('timeline').fire('input');
+  assert.equal(el('historical-trades').children.length, 100, 'Tape DOM must remain bounded');
+  assert.equal(el('event-log').children.length, 50, 'Event log DOM must remain bounded');
+  assert.equal(el('historical-depth').children.length, 5);
+  assert.match(el('trade-count').textContent, /^6357 RECORDED/);
+  assert(!el('historical-spread').textContent.includes('₹'), 'Wrong historical units');
+  assert.equal(el('synthetic-charts').hidden, true);
+  assert.equal(el('historical-charts').hidden, false);
+  await el('restart').fire('click');
+  assert.equal(el('historical-depth').children.length, 0);
+  await el('play').fire('click'); [...timers.values()][0](); await el('play').fire('click');
+  assert.equal(el('event-count').textContent, `2 / ${data.events.length}`);
+  el('scenario').value = 'inventory-risk'; await el('scenario').fire('change'); await settle();
+  assert.equal(el('historical-metrics').hidden, true);
+  assert.equal(el('synthetic-metrics').hidden, false);
+  assert.equal(el('reference').textContent, '₹100.00');
+  el('scenario').value = 'imported'; await el('scenario').fire('change');
+  assert.equal(el('historical-metrics').hidden, false);
+  el('upload').files = [{ size: 1, text: async () => '{"schema":"historical-market","schema_version":99}' }];
+  await el('upload').fire('change'); assert.match(el('error').textContent, /Unsupported historical/);
+  console.log('PASS: actual historical schema, no look-ahead, snapshot persistence, UTC/USDT/BTC formatting, playback, bounded tape/log, and synthetic switching (DOM fixture)');
+}

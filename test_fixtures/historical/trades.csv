@@ -1,0 +1,4 @@
+exchange,symbol,timestamp,local_timestamp,id,side,price,amount
+binance,BTCUSDT,1704067200000095,1704067200000100,fixture-a,buy,100.12345678,0.00000001
+binance,BTCUSDT,1704067200000295,1704067200000300,"fixture,""quoted""",sell,100,0.00000002
+binance,BTCUSDT,1704067200000294,1704067200000300,fixture-c,unknown,100.00000001,0.00000003

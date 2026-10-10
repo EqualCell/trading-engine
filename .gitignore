@@ -10,3 +10,8 @@ simulator_tests
 
 market_maker_demo
 market_maker_tests
+
+# Historical provider data and raw-derived exports stay local.
+/.local_data/
+/dashboard/data/historical/
+historical_replay
