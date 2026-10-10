@@ -1,4 +1,4 @@
-#include "market_maker.h"
+#include "market_maker_scenarios.h"
 
 #include <functional>
 #include <iostream>
@@ -216,6 +216,36 @@ void checkedValuation() {
     requireThrows<std::overflow_error>([&] { markedValuation({maximum, 0}, 1, -1); });
 }
 
+void exportPrimitivesAndImmediateFills() {
+    require(jsonString("\"\\\n\r\t" + std::string(1, '\1')) ==
+            "\"\\\"\\\\\\n\\r\\t\\u0001\"", "JSON string escaping");
+    TradingSimulator sim;
+    sim.createAccount(1, 100000, 0);
+    sim.createAccount(2, 100000, 10);
+    OrderIdSource ids;
+    sim.submitOrder(2, {ids.next(), Side::Sell, 9800, 1});
+    MarketMaker maker(sim, ids, 1, 100, 5);
+    const auto fills = maker.refreshQuotes(10000);
+    requireTrades(fills, {{2, 1, 9800, 1}});
+    require(!sim.orderBook().activeOrder(*maker.lastBuyId()), "immediate buy exported as active");
+    const auto ask = sim.orderBook().activeOrder(*maker.lastSellId());
+    require(ask && ask->remaining_qty == 1 && ask->price == 10100, "active maker ask missing");
+    std::ostringstream quote;
+    writeQuoteJson(quote, sim.orderBook().activeOrder(*maker.lastBuyId()));
+    require(quote.str() == "null", "filled quote JSON");
+    ScenarioResult result;
+    result.name = "immediate-fill";
+    result.description = "Immediate execution during strategy refresh";
+    const Account account = sim.getAccount(1);
+    result.events.push_back({0, 0, "quote_refresh", result.description, 10000,
+                             std::nullopt, ask, account,
+                             markedValuation(account, 10000, 100000), fills});
+    std::ostringstream output;
+    writeScenarioJson(output, result);
+    require(output.str().find("\"buy_id\":\"2\",\"sell_id\":\"1\",\"price_paise\":\"9800\",\"quantity\":\"1\"") != std::string::npos,
+            "immediate execution lost in JSON serialization");
+}
+
 int main() {
     using Test = std::pair<const char*, std::function<void()>>;
     const std::vector<Test> tests = {
@@ -225,7 +255,8 @@ int main() {
         {"immediate executions and updated inventory", immediateExecutions},
         {"invalid configuration and quote prices", invalidInputs},
         {"ID exhaustion without wrapping", idExhaustion},
-        {"checked marked valuation", checkedValuation}
+        {"checked marked valuation", checkedValuation},
+        {"JSON escaping, active quotes, and immediate executions", exportPrimitivesAndImmediateFills}
     };
     int failures = 0;
     for (const auto& [name, test] : tests) {

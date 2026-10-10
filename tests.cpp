@@ -234,9 +234,29 @@ void duplicateIdRejection() {
             "rejected duplicates should not alter the book");
 }
 
+void activeOrderSnapshots() {
+    OrderBook book;
+    require(!book.activeOrder(999), "unknown snapshot must be absent");
+    book.addOrder({1, Side::Sell, 100, 3});
+    auto snapshot = book.activeOrder(1);
+    require(snapshot && snapshot->remaining_qty == 3 && snapshot->side == Side::Sell,
+            "active snapshot wrong");
+    snapshot->remaining_qty = 999;
+    require(book.activeOrder(1)->remaining_qty == 3, "snapshot exposed mutable state");
+    book.addOrder({2, Side::Buy, 100, 1});
+    require(!book.activeOrder(2) && book.activeOrder(1)->remaining_qty == 2,
+            "partial fill snapshot wrong");
+    book.addOrder({3, Side::Buy, 100, 2});
+    require(!book.activeOrder(1) && !book.activeOrder(3), "filled order snapshot present");
+    book.addOrder({4, Side::Buy, 90, 1});
+    book.cancelOrder(4);
+    require(!book.activeOrder(4), "cancelled snapshot present");
+}
+
 int main() {
     using Test = std::pair<const char*, std::function<void()>>;
     const std::vector<Test> tests = {
+        {"active order snapshots by value", activeOrderSnapshots},
         {"non-crossing orders", nonCrossingOrders},
         {"best-price priority for incoming buy", buyBestPrice},
         {"best-price priority for incoming sell", sellBestPrice},

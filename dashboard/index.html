@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Replay deterministic C++ market-making scenarios, with exact accounting and event-by-event inspection.">
+  <title>Quote / Replay — C++ market-making simulator</title>
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="./"><span class="brand-mark">Q/</span> QUOTE / REPLAY</a><span class="source-badge">C++ ENGINE → JSON → REPLAY</span></header>
+  <main>
+    <section class="intro">
+      <div><p class="eyebrow">DETERMINISTIC MARKET MAKING</p><h1>A spread earned.<br>An inventory risk held.</h1><p class="lede">Follow every quote, fill, and balance change.<br>Three short experiments, exported from the actual C++ engine.</p></div>
+      <aside class="intro-note"><span class="note-number">01 / INSPECT THE MECHANICS</span><p>Synthetic market-making simulation. No fees or latency modeled. P&L is marked to a supplied reference price.</p><p class="muted">Playback is slowed for inspection. It does not measure engine processing speed.</p></aside>
+    </section>
+    <section class="panel controls" aria-label="Replay controls">
+      <div class="scenario-line"><div><label for="scenario">EXPERIMENT</label><select id="scenario"><option value="inventory-risk">02 · Inventory risk</option><option value="spread-capture">01 · Spread capture</option><option value="inventory-limit">03 · Inventory limit</option></select></div><div class="upload"><label for="upload">Or import a schema v1 export</label><input id="upload" type="file" accept=".json,application/json"></div></div>
+      <p id="description" class="scenario-description">Loading scenario…</p>
+      <p id="status" role="status" aria-live="polite">Loading engine export…</p><p id="error" role="alert" hidden></p>
+      <div class="transport"><button id="restart" disabled aria-label="Restart replay">↺ Restart</button><button id="previous" disabled aria-label="Previous event">← Previous</button><button id="play" class="primary" disabled aria-label="Play replay">▶ Play</button><button id="next" disabled aria-label="Next event">Next →</button><label class="speed" for="speed">Speed<select id="speed"><option value="0.5">0.5 events/s</option><option value="1" selected>1 event/s</option><option value="2">2 events/s</option><option value="4">4 events/s</option></select></label><span id="event-count" class="mono">— / —</span></div>
+      <label class="sr-only" for="timeline">Selected replay event</label><input id="timeline" type="range" min="0" max="0" value="0" disabled>
+      <div class="timeline-caption"><span id="event-type">—</span><span id="timestamp" class="mono">— µs</span></div>
+    </section>
+    <section class="metrics" aria-label="Maker account after selected event">
+      <article class="metric"><h2>Reference price</h2><p id="reference">—</p><small>Externally supplied mark</small></article>
+      <article class="metric"><h2>Maker cash</h2><p id="cash">—</p><small>Available account balance</small></article>
+      <article class="metric"><h2>Inventory</h2><p id="inventory">—</p><small id="inventory-limit">units</small></article>
+      <article class="metric"><h2>Marked value</h2><p id="value">—</p><small>Cash + inventory × reference</small></article>
+      <article class="metric pnl-card"><h2>Total marked P&L</h2><p id="pnl">—</p><small>Since initial portfolio value</small></article>
+    </section>
+    <section class="panel price-panel"><div class="panel-heading"><div><p class="eyebrow">01 / QUOTES & REFERENCE</p><h2>The price path</h2></div><div class="legend"><span class="reference-dot">Reference</span><span class="bid-dot">Maker bid</span><span class="ask-dot">Maker ask</span></div></div><div class="quote-strip"><div id="bid">No active bid</div><div id="ask">No active ask</div></div><div id="price-chart" class="chart" role="img" aria-label="Reference and active maker quote prices through the selected event"></div><p class="chart-note">State after each event · missing quotes leave gaps · timestamps in microseconds</p></section>
+    <div class="chart-grid"><section class="panel"><div class="panel-heading"><div><p class="eyebrow">02 / EXPOSURE</p><h2>Inventory held</h2></div><span class="unit-tag">UNITS</span></div><div id="inventory-chart" class="chart small" role="img" aria-label="Inventory through the selected event"></div></section><section class="panel"><div class="panel-heading"><div><p class="eyebrow">03 / MARKED RETURN</p><h2>Total P&L</h2></div><span class="unit-tag">RUPEES</span></div><div id="pnl-chart" class="chart small" role="img" aria-label="Marked P and L through the selected event"></div></section></div>
+    <div class="detail-grid"><section class="panel"><div class="panel-heading"><div><p class="eyebrow">04 / EXECUTIONS</p><h2>Trade tape</h2></div><span id="trade-count" class="unit-tag">0 FILLS</span></div><div class="table-scroll"><table><caption class="sr-only">Executed trades through the selected event</caption><thead><tr><th>Event / µs</th><th>Buy ID</th><th>Sell ID</th><th>Price</th><th>Units</th></tr></thead><tbody id="trades"></tbody></table><p id="no-trades" class="empty">No executions yet. Quotes are waiting for a counterparty.</p></div></section><section class="panel"><div class="panel-heading"><div><p class="eyebrow">05 / EVENT HISTORY</p><h2>What happened</h2></div></div><ol id="event-log" class="event-log"></ol></section></div>
+    <footer><div><strong>Built to explain, not predict.</strong><p>One-unit fixed-spread quotes. Explicit refreshes only. Cancel-and-replace loses FIFO priority. Quotes may execute immediately.</p></div><p>No buying-power checks, fees, latency, margin, funding costs, or self-trade prevention. Negative balances are allowed; resting orders reserve no funds.</p><details><summary>Export metadata & modeling assumptions</summary><p id="metadata"></p><ul id="assumptions"></ul></details></footer>
+  </main>
+</body>
+</html>

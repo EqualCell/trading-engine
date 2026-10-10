@@ -1,0 +1,15 @@
+{
+  "schema_version":1,
+  "scenario":"spread-capture",
+  "description":"A one-unit round trip captures 200 paise before fees.",
+  "units":{"money":"paise","quantity":"units","time":"microseconds"},
+  "assumptions":["Synthetic externally supplied reference price","No fees, latency, margin, or funding costs","Negative cash and inventory permitted","No funds reserved for resting orders","No post-only rule or self-trade prevention","Explicit refresh only; cancel-and-replace loses FIFO priority","Maker account exclusively strategy-controlled","Snapshots describe state after each event"],
+  "strategy":{"trader_id":"1","half_spread_paise":"100","inventory_limit":"5","order_quantity":"1"},
+  "initial_accounts":[{"trader_id":"1","cash_paise":"100000","inventory":"0"},{"trader_id":"2","cash_paise":"100000","inventory":"10"}],
+  "initial_portfolio_value_paise":"100000",
+  "events":[
+    {"event_index":"0","timestamp_us":"0","type":"quote_refresh","description":"Reference 10000: refresh quotes","reference_price_paise":"10000","maker_bid":{"order_id":"1","price_paise":"9900","remaining_quantity":"1"},"maker_ask":{"order_id":"2","price_paise":"10100","remaining_quantity":"1"},"cash_paise":"100000","inventory":"0","portfolio_value_paise":"100000","total_pnl_paise":"0","trades":[]},
+    {"event_index":"1","timestamp_us":"1000","type":"external_sell","description":"External trader sells one at limit 9900","reference_price_paise":"10000","maker_bid":null,"maker_ask":{"order_id":"2","price_paise":"10100","remaining_quantity":"1"},"cash_paise":"90100","inventory":"1","portfolio_value_paise":"100100","total_pnl_paise":"100","trades":[{"buy_id":"1","sell_id":"3","price_paise":"9900","quantity":"1"}]},
+    {"event_index":"2","timestamp_us":"2000","type":"external_buy","description":"External trader buys one at limit 10100","reference_price_paise":"10000","maker_bid":null,"maker_ask":null,"cash_paise":"100200","inventory":"0","portfolio_value_paise":"100200","total_pnl_paise":"200","trades":[{"buy_id":"4","sell_id":"2","price_paise":"10100","quantity":"1"}]}
+  ]
+}

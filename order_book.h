@@ -173,6 +173,13 @@ public:
         return *ask - *bid;
     }
 
+    // Return a copy: callers cannot change engine state or retain an iterator.
+    std::optional<Order> activeOrder(ull id) const {
+        const auto found = active_orders.find(id);
+        if (found == active_orders.end()) return std::nullopt;
+        return *found->second.position;
+    }
+
     bool cancelOrder(ull id) {
         auto found = active_orders.find(id);
         if (found == active_orders.end()) {
