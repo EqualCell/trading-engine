@@ -7,3 +7,6 @@ tests
 benchmark
 
 simulator_tests
+
+market_maker_demo
+market_maker_tests
