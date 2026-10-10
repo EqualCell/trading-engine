@@ -5,3 +5,5 @@ build/
 tests
 
 benchmark
+
+simulator_tests
