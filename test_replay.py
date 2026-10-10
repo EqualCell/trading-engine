@@ -2,6 +2,7 @@
 """CLI integration checks for interactive, plain, and timed replay modes."""
 
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 
@@ -81,6 +82,104 @@ def main():
 
     with tempfile.TemporaryDirectory() as temp:
         folder = Path(temp)
+        header = "timestamp_us,buy_id,sell_id,price_paise,quantity\n"
+        example_csv = folder / "example.csv"
+        example_csv.write_text("old contents\n")
+        csv_example = run("--replay-timed", ROOT / "examples" / "timed_orders.txt",
+                          "--trades-csv", example_csv)
+        check(csv_example.returncode == 0 and
+              example_csv.read_text() ==
+              header + "1000,3,1,10100,4\n1000,3,2,10100,2\n",
+              "example CSV contents are wrong")
+        check_summary(csv_example.stdout, 3, 0, 2, 6, 1)
+        check("TRADE buy=3 sell=1 price=10100 qty=4" in csv_example.stdout,
+              "CSV option changed terminal trade output")
+
+        events = folder / "csv_events.txt"
+        events.write_text("0 SELL 1 100 2\n0 SELL 2 100 1\n"
+                          "10 BUY 3 100 3\n20 SELL 4 100 1\n"
+                          "30 BUY 5 100 1\n")
+        events_csv = folder / "events.csv"
+        events_result = run("--replay-timed", events, "--trades-csv", events_csv)
+        check(events_result.returncode == 0 and
+              events_csv.read_text() ==
+              header + "10,3,1,100,2\n10,3,2,100,1\n30,5,4,100,1\n",
+              "CSV trades should follow execution order and incoming timestamps")
+
+        no_trades = folder / "no_trades.txt"
+        no_trades.write_text("0 SELL 1 100 1\n1 QUOTE\n")
+        no_trades_csv = folder / "no_trades.csv"
+        no_trades_result = run("--replay-timed", no_trades,
+                               "--trades-csv", no_trades_csv)
+        check(no_trades_result.returncode == 0 and
+              no_trades_csv.read_text() == header,
+              "no-trade CSV should contain only its header")
+
+        rejected_input = folder / "rejected_csv.txt"
+        rejected_input.write_text("0 SELL 1 100 1\n"
+                                  "1 SELL 1 100 1\n"
+                                  "2 BUY 2 100 1\n"
+                                  "3 EXIT extra\n"
+                                  "4 SELL 3 100 1\n"
+                                  "5 EXIT\n"
+                                  "6 BUY 4 100 1\n")
+        rejected_csv = folder / "rejected.csv"
+        rejected_result = run("--replay-timed", rejected_input,
+                              "--trades-csv", rejected_csv)
+        check(rejected_result.returncode == 1 and
+              rejected_csv.read_text() == header + "2,2,1,100,1\n" and
+              "ACCEPTED order 4" not in rejected_result.stdout,
+              "rejections and valid EXIT should not add CSV rows")
+        check_summary(rejected_result.stdout, 3, 2, 1, 1, 0)
+
+        collisions = folder / "collision.txt"
+        collisions.write_text("0 SELL 1 100 1\n")
+        original = collisions.read_bytes()
+        aliases = [collisions]
+        hard_link = folder / "collision_hard.txt"
+        try:
+            os.link(collisions, hard_link)
+            aliases.append(hard_link)
+        except OSError:
+            pass
+        symlink = folder / "collision_symlink.txt"
+        try:
+            symlink.symlink_to(collisions)
+            aliases.append(symlink)
+        except OSError:
+            pass
+        for alias in aliases:
+            result = run("--replay-timed", collisions, "--trades-csv", alias)
+            check(result.returncode != 0 and
+                  "refers to the replay input file" in result.stderr and
+                  "Replay summary:" not in result.stdout and
+                  collisions.read_bytes() == original,
+                  f"input/output collision must preserve input: {alias}")
+
+        blocked_csv = folder / "missing_parent" / "trades.csv"
+        blocked = run("--replay-timed", collisions, "--trades-csv", blocked_csv)
+        check(blocked.returncode != 0 and
+              "Cannot open trades CSV file" in blocked.stderr and
+              "ACCEPTED order" not in blocked.stdout and
+              "Replay summary:" not in blocked.stdout,
+              "output-open failure should precede replay")
+
+        if Path("/dev/full").exists():
+            full = run("--replay-timed", events, "--trades-csv", "/dev/full")
+            check(full.returncode != 0 and
+                  "trades CSV" in full.stderr and
+                  "Replay summary:" not in full.stdout,
+                  "/dev/full output failure should omit summary")
+
+        missing_input = folder / "no_input.txt"
+        untouched_csv = folder / "untouched.csv"
+        untouched_csv.write_text("keep me\n")
+        missing_before_output = run("--replay-timed", missing_input,
+                                    "--trades-csv", untouched_csv)
+        check(missing_before_output.returncode != 0 and
+              untouched_csv.read_text() == "keep me\n",
+              "missing input must not truncate CSV output")
+
         empty = replay_file(folder, "empty.txt", "")
         check(empty.returncode == 0, "empty replay should succeed")
         check_summary(empty.stdout, 0, 0, 0, 0, 0)
@@ -213,6 +312,13 @@ def main():
               "Replay summary:" not in directory.stdout, "read failure should omit summary")
 
         for args in [("--replay",), ("--replay-timed",), ("--unknown",),
+                     ("--replay", collisions, "--trades-csv", folder / "bad.csv"),
+                     ("--replay-timed", collisions, "--trades-csv"),
+                     ("--replay-timed", collisions, "--trades-csv", ""),
+                     ("--replay-timed", "", "--trades-csv", folder / "bad.csv"),
+                     ("--replay-timed", collisions, "--unknown", folder / "bad.csv"),
+                     ("--replay-timed", collisions, "--trades-csv",
+                      folder / "bad.csv", "extra"),
                      ("--replay", "a", "extra"), ("--replay-timed", "a", "extra")]:
             bad = run(*args)
             check(bad.returncode != 0 and "Usage:" in bad.stderr,

@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -71,7 +72,8 @@ uint64_t parseTimestamp(const string& text) {
 
 // Returns true only for a valid EXIT command.
 bool processLine(const string& line, OrderBook& book, ReplayStats& stats,
-                 bool replay, size_t line_number) {
+                 bool replay, size_t line_number, uint64_t timestamp = 0,
+                 ostream* trades_csv = nullptr) {
     stringstream ss(line);
     string command;
     ss >> command;
@@ -117,6 +119,14 @@ bool processLine(const string& line, OrderBook& book, ReplayStats& stats,
                 filled += trade.quantity;
                 ++stats.trades;
                 stats.traded_quantity += static_cast<uint64_t>(trade.quantity);
+                if (trades_csv) {
+                    *trades_csv << timestamp << ',' << trade.buy_id << ','
+                                << trade.sell_id << ',' << trade.price << ','
+                                << trade.quantity << '\n';
+                    if (!*trades_csv) {
+                        throw ios_base::failure("Error writing trades CSV");
+                    }
+                }
             }
             cout << "Filled: " << filled
                  << " | Resting: " << qty - filled << '\n';
@@ -187,9 +197,14 @@ void printSummary(const ReplayStats& stats, bool timed = false,
 
 int main(int argc, char* argv[]) {
     const bool replay = argc == 3 && string(argv[1]) == "--replay" && argv[2][0] != '\0';
-    const bool timed = argc == 3 && string(argv[1]) == "--replay-timed" && argv[2][0] != '\0';
-    if (argc != 1 && !replay && !timed) {
-        cerr << "Usage: " << argv[0] << " [--replay filename | --replay-timed filename]\n";
+    const bool timed = (argc == 3 || argc == 5) &&
+        string(argv[1]) == "--replay-timed" && argv[2][0] != '\0';
+    const bool csv_requested = timed && argc == 5 &&
+        string(argv[3]) == "--trades-csv" && argv[4][0] != '\0';
+    if (argc != 1 && !replay && !(timed && (argc == 3 || csv_requested))) {
+        cerr << "Usage: " << argv[0]
+             << " [--replay filename | --replay-timed filename"
+             << " [--trades-csv filename]]\n";
         return 1;
     }
 
@@ -201,6 +216,38 @@ int main(int argc, char* argv[]) {
         if (!input) {
             cerr << "Cannot open replay file: " << argv[2] << '\n';
             return 1;
+        }
+        ofstream csv;
+        if (csv_requested) {
+            // An existing output may be replaced, unless it is the input itself.
+            error_code error;
+            const bool output_exists = filesystem::exists(argv[4], error);
+            if (error) {
+                cerr << "Cannot inspect trades CSV path: " << error.message() << '\n';
+                return 1;
+            }
+            if (output_exists) {
+                const bool same_file = filesystem::equivalent(argv[2], argv[4], error);
+                if (error) {
+                    cerr << "Cannot compare replay and trades CSV paths: "
+                         << error.message() << '\n';
+                    return 1;
+                }
+                if (same_file) {
+                    cerr << "Trades CSV output refers to the replay input file\n";
+                    return 1;
+                }
+            }
+            csv.open(argv[4]);
+            if (!csv) {
+                cerr << "Cannot open trades CSV file: " << argv[4] << '\n';
+                return 1;
+            }
+            csv << "timestamp_us,buy_id,sell_id,price_paise,quantity\n";
+            if (!csv) {
+                cerr << "Error writing trades CSV: " << argv[4] << '\n';
+                return 1;
+            }
         }
         size_t line_number = 0;
         optional<uint64_t> simulation_time;
@@ -236,7 +283,16 @@ int main(int argc, char* argv[]) {
                 getline(fields, arguments);
                 simulation_time = timestamp;
                 cout << "Time (us): " << timestamp << '\n';
-                if (processLine(command + arguments, book, stats, true, line_number)) {
+                bool exit_requested;
+                try {
+                    exit_requested = processLine(command + arguments, book, stats,
+                                                 true, line_number, timestamp,
+                                                 csv_requested ? &csv : nullptr);
+                } catch (const ios_base::failure&) {
+                    cerr << "Error writing trades CSV: " << argv[4] << '\n';
+                    return 1;
+                }
+                if (exit_requested) {
                     break;
                 }
             } else if (processLine(line, book, stats, true, line_number)) {
@@ -246,6 +302,18 @@ int main(int argc, char* argv[]) {
         if (input.bad() || (!input.eof() && input.fail())) {
             cerr << "Error reading replay file: " << argv[2] << '\n';
             return 1;
+        }
+        if (csv_requested) {
+            csv.flush();
+            if (!csv) {
+                cerr << "Error flushing trades CSV: " << argv[4] << '\n';
+                return 1;
+            }
+            csv.close();
+            if (!csv) {
+                cerr << "Error closing trades CSV: " << argv[4] << '\n';
+                return 1;
+            }
         }
         printSummary(stats, timed, simulation_time);
         return stats.rejected_commands == 0 ? 0 : 1;
