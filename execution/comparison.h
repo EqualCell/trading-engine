@@ -12,6 +12,7 @@ struct Scenario {
     Task task;
     Account initial;
     std::vector<ScriptEvent> script;
+    Instrument instrument = {};
 };
 inline std::vector<Scenario> comparisonScenarios() {
     const Task task{Side::Buy, 6, 10, 100, 120};
@@ -37,7 +38,7 @@ inline std::vector<Scenario> comparisonScenarios() {
 }
 struct ComparisonResult { Summary summary; std::string trace; };
 inline ComparisonResult compareRun(const Scenario& scenario, PolicyConfig config, Time request_delay = 2, Time response_delay = 5) {
-    Experiment run(scenario.task, scenario.initial, request_delay, response_delay, config);
+    Experiment run(scenario.task, scenario.initial, request_delay, response_delay, config, scenario.instrument);
     // Scenario keys map to this fresh experiment's external IDs, never guessed
     // from the number of strategy orders or rewritten after observing a fill.
     std::map<std::string, ull> external;

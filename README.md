@@ -768,3 +768,144 @@ fixed external flow, fixed delays, zero fees, and one fictional instrument. It
 does not establish predictive performance in real markets, optimal slice counts,
 latency fidelity, or a general execution framework. No historical integration,
 frontend changes, live adapter, threads, or additional policy follows this milestone.
+
+## Milestone C1: explicit execution instrument units
+
+Execution now accepts one validated `Instrument` specification per experiment:
+symbol/base/quote labels, price and quantity decimal places, positive tick and
+step increments in their respective atoms, and adapter maximum price/quantity
+atoms. `execution/units.h` moves the execution layer's existing checked 64-bit
+addition/product helpers into the unit module and adds strict decimal conversion.
+The historical helpers are fixed to eight-place market data or 128-bit backtest
+settlement; their syntax, precision, fees, and behavior remain unchanged. No
+historical execution adapter or universal rewrite of `TradingSimulator` is added.
+
+The exact representation is:
+
+```text
+price value    = price atoms    / 10^price_decimals
+quantity value = quantity atoms / 10^quantity_decimals
+cash_decimals  = price_decimals + quantity_decimals
+cash value     = cash atoms     / 10^cash_decimals
+fill notional cash atoms = price atoms × quantity atoms
+```
+
+All monetary and quantity values remain signed 64-bit integers. Price/quantity
+places individually and their sum must be in **0..18**; integer powers of ten are
+checked. Amounts must fit `0..9223372036854775807` atoms. A valid scale/specification
+does **not** make all products representable: parsing, reservations, funding,
+notional, cumulative totals, and inventory/cash headroom are checked separately.
+Each submitted order's positive price/quantity must align exactly with its tick
+and step; no rounding onto the grid occurs. Maximum adapter price and per-order
+quantity default to `1000000000` atoms and may be explicitly configured; positive
+increments must fit those bounds. Conservative sell funding uses the highest
+permitted tick-aligned price to reserve numerical headroom for proceeds.
+
+Default `WHOLE` is `UNIT/INR`, with price places 2, quantity places 0, cash places
+2, tick 1 paise, and step 1 unit. Existing raw price, quantity, cash, reservations,
+and output labels retain their meaning. Both A demo traces and the B comparison
+with traces were checked **byte-for-byte against pre-C1 output**, with unchanged
+numerical results. Other instruments use `_atoms` labels and explicit precision
+metadata rather than calling USDT values paise. Initial cash/inventory can be
+nonnegative atom amounts; a holding need not equal a tradable quantity-step lot,
+but orders must. No borrowing, shorting, or fees are introduced.
+
+The adapter passes price/quantity **atoms** into the unchanged `OrderBook`.
+Its integer ordering and matching need no currency-specific logic; the execution
+layer supplies and interprets every integer with the same experiment specification.
+Task and scripted external prices/quantities are validated before engine mutation;
+invalid exchange inputs yield rejections. The same multi-order manager and
+immediate/scheduled policies handle both default and decimal instruments. Cash
+reservation and actual notional are exact atom products. Delivered partial fills
+release only their own limit-price reservation, making price improvement available;
+pending cancellation and undelivered exchange truth cannot release resources.
+Identical execution duplicates cannot update balances or reservations twice.
+
+### Decimal syntax and formatting
+
+`parseDecimal(text, places)` and the instrument's `price`, `quantity`, and `cash`
+helpers accept **nonnegative digits, optionally a dot followed by digits**, e.g.
+`0`, `43000.12`, `0.00123000`. Leading zeroes are accepted. Signs (including `+`),
+whitespace, omitted whole/fraction components (`.1`, `1.`), multiple dots,
+exponents, NaN, infinity, and other characters are rejected. Beyond-scale digits
+are accepted **only when every extra digit is zero**: `1.23000` is valid at scale
+2, while `1.23001` fails. Overflow is detected before each multiplication/addition.
+Parsing representability does not imply tick/step alignment; validate the order
+separately with `validatePrice`, `validateQuantity`, or `validateOrder`.
+
+Formatting is compact and deterministic: removable trailing fractional zeroes
+are omitted, zero prints `0`, and meaningful fractional cash digits are retained
+at **cash scale**, rather than reduced to a currency's usual display precision.
+For example, `528901476000` cash atoms at scale 10 print `52.8901476`, and one atom
+prints `0.0000000001`. Accounting never uses binary floating-point values.
+
+Average price retains the exact `total cash atoms / total quantity atoms` ratio,
+which is in **price atoms**. The displayed integer price atom is rounded **down**;
+its decimal display uses price places, and the trace labels this approximation.
+Average formatting never feeds back into balances. Zero fills show unavailable.
+
+### Illustrative fractional demonstrations
+
+These settings are illustrative **BTC/USDT-style**, not current or historical
+Binance filters: price places 2, quantity places 8, tick 1 price atom (0.01
+USDT/BTC), step 1000 quantity atoms (0.00001000 BTC), and cash places **10**.
+Each run starts with 1000 USDT, zero BTC, target 0.00123000 BTC and limit 43010.00
+USDT/BTC. Request/report delays remain 2/5 µs and start/deadline are 10/100 µs.
+Executions come from the controlled engine using registered external orders.
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Wpedantic execution_decimal_demo.cpp -o execution_decimal_demo
+g++ -std=c++17 -Wall -Wextra -Wpedantic execution_decimal_tests.cpp -o execution_decimal_tests
+./execution_decimal_tests
+./execution_decimal_demo              # all three controlled examples
+./execution_decimal_demo immediate
+./execution_decimal_demo partial
+./execution_decimal_demo scheduled
+
+# Existing execution regressions (rebuild using A/B commands above):
+./execution_tests
+./execution_slicing_tests
+./execution_demo
+./execution_compare --trace
+```
+
+| Example | Executed BTC | Exact cost · USDT | Final cash · USDT | Final BTC |
+| --- | ---: | ---: | ---: | ---: |
+| Immediate | 0.00123 | 52.8901476 | 947.1098524 | 0.00123 |
+| Partial fill then later external sell | 0.00123 | 52.89736 | 947.10264 | 0.00123 |
+| Scheduled, five slices | 0.00123 | 52.8901476 | 947.1098524 | 0.00123 |
+
+The immediate order reserves **52.9023 USDT** locally before acknowledgment and
+executes against a resting sell at **43000.12 USDT/BTC**, yielding **52.8901476
+USDT** notional and zero final reservation. Exact atom values: limit `4301000`,
+execution price `4300012`, quantity `123000`, reservation `529023000000`, notional
+`528901476000`, and final cash `9471098524000`.
+
+The partial example first fills **0.00050 BTC at 43000.12**, costing **21.50006
+USDT**. Its remaining **0.00073 BTC** retains **31.3973 USDT** cash reservation.
+A later incoming sell fills this resting buy at **43010**, costing **31.3973
+USDT**; no lower incoming ask price is fabricated as execution price. Average
+price display is **43005.98**, rounded down to a price atom, with exact ratio
+`528973600000/123000` price atoms preserved.
+
+Slicing now operates in **tradable lots**: `target atoms / step atoms` is divided
+by slice count using quotient/remainder, then converted back to atoms with
+checked multiplication. N greater than total lots is rejected. For 123 lots and
+five slices, lots are **25, 25, 25, 24, 24**, quantities **0.00025, 0.00025,
+0.00025, 0.00024, 0.00024 BTC**, and delivery times **10, 28, 46, 64, 82 µs**.
+The existing timestamp/deadline/cancellation rules are unchanged. All examples
+settle with zero reservations and unresolved orders.
+
+The seven new focused test groups use independent literal expectations for
+parse/format syntax, unsupported specs/scales, separate grids, exact purchase and
+sell proceeds, delivered-account timing, partial resources and price improvement,
+pending cancellations, rejection/duplicate behavior, lot slices, zero-fill
+averages, sub-cent formatting, and parsing/notional/reservation/total overflow
+without partial resource updates. Existing execution, slicing, engine, simulator,
+CLI, historical/backtest, and frontend regression tests remain applicable.
+
+This milestone supplies **representation precision**, not real-venue trading
+filters, minimum notional rules, latency calibration, or venue fidelity. It has
+one instrument per run, no fees, and no historical execution integration. The
+original engine, simulator, historical accounting, frontend, and unrelated work
+are preserved. No data download, commit, push, or deployment is part of C1.

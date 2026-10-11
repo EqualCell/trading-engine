@@ -28,3 +28,7 @@ execution_tests
 # Scheduled execution comparison.
 execution_compare
 execution_slicing_tests
+
+# Unit-aware exact-decimal execution.
+execution_decimal_demo
+execution_decimal_tests

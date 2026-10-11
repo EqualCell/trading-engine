@@ -1,5 +1,5 @@
 #pragma once
-#include "../order_book.h"
+#include "units.h"
 #include <limits>
 #include <queue>
 #include <sstream>
@@ -8,20 +8,8 @@
 #include <utility>
 
 namespace execution {
-// Fictional WHOLE instrument: whole quantities, paise prices/cash, microsecond time.
+// One instrument per experiment: price/quantity/cash atoms, microsecond time.
 using Time = ll;
-constexpr ll MAX_PRICE = 1000000000, MAX_QUANTITY = 1000000000;
-inline void require(bool ok, const std::string& message) { if (!ok) throw std::invalid_argument(message); }
-inline ll add(ll a, ll b) {
-    if ((b > 0 && a > std::numeric_limits<ll>::max() - b) ||
-        (b < 0 && a < std::numeric_limits<ll>::min() - b)) throw std::overflow_error("Integer addition overflow");
-    return a + b;
-}
-inline ll product(ll a, ll b) {
-    require(a >= 0 && b >= 0, "Expected nonnegative product");
-    if (b && a > std::numeric_limits<ll>::max() / b) throw std::overflow_error("Integer product overflow");
-    return a * b;
-}
 inline Time delayed(Time time, Time delay) { require(time >= 0 && delay >= 0, "Negative simulated time/delay"); return add(time, delay); }
 inline const char* sideText(Side side) { return side == Side::Buy ? "buy" : "sell"; }
 
@@ -67,6 +55,7 @@ public:
         return id;
     }
 };
+// Task price/target and Account inventory are instrument atoms; cash uses summed scale.
 struct Task { Side side; ll target; Time start, deadline; ll limit_price; };
 struct Account { ll cash, inventory; };
 enum class ReportType { Accepted, Rejected, Fill, Cancelled, CancelRejected };
@@ -92,6 +81,7 @@ struct Report {
 // Exchange truth: not used to update the locally observed account.
 struct Execution { ull id, order_id; Side side; ll price, quantity; Time time; };
 class Exchange {
+    Instrument instrument;
     OrderBook book;
     std::unordered_map<ull, bool> strategy_orders;
     std::unordered_map<ull, Order> requests;
@@ -102,7 +92,7 @@ class Exchange {
         emit({type, order.id, execution_id, order.side, price ? price : order.price, quantity, time, 0, strategy_orders.at(order.id), reason});
     }
 public:
-    explicit Exchange(std::function<void(Report)> deliver) : emit(std::move(deliver)) {}
+    explicit Exchange(std::function<void(Report)> deliver, Instrument specification = {}) : instrument(std::move(specification)), emit(std::move(deliver)) { instrument.validate(); }
     std::vector<Execution> truth;
     void submit(Order order, bool strategy, Time time) {
         require(time >= 0, "Negative exchange time");
@@ -111,13 +101,18 @@ public:
         }
         // Remember rejected requests too, so a subsequent cancellation has a reason.
         requests.emplace(order.id, order); strategy_orders.emplace(order.id, strategy);
-        std::vector<Trade> trades;
         try {
-            require(order.id > 0 && order.price > 0 && order.price <= MAX_PRICE && order.remaining_qty > 0 && order.remaining_qty <= MAX_QUANTITY, "Instrument price/quantity/ID bounds");
-            trades = book.addOrder(order);
+            require(order.id > 0, "Order ID must be positive");
+            require(order.side == Side::Buy || order.side == Side::Sell, "Invalid order side");
+            instrument.validateOrder(order.price, order.remaining_qty);
+        } catch (const std::overflow_error& error) {
+            send(ReportType::Rejected, order, time, 0, error.what()); return;
         } catch (const std::invalid_argument& error) {
             send(ReportType::Rejected, order, time, 0, error.what()); return;
         }
+        // Validation rejections occur before mutation. Any engine failure escapes;
+        // it is never reclassified as a safe numerical rejection.
+        const auto trades = book.addOrder(order);
         // Acceptance precedes individual fills. Its quantity is submitted quantity,
         // never an execution. Other exceptions escape: engine is not transactional.
         send(ReportType::Accepted, order, time, order.remaining_qty);
@@ -166,6 +161,7 @@ struct OrderState {
 struct Submission { bool accepted; std::string reason; };
 class OrderManager {
     Task task;
+    Instrument instrument;
     std::map<ull, OrderState> tracked;
     std::unordered_map<ull, Report> executions;
     ll reserved_cash_total = 0, reserved_inventory_total = 0;
@@ -177,7 +173,8 @@ public:
     Account account;
     ll notional = 0, executed = 0, submitted_quantity = 0;
     ll submitted_orders = 0, local_rejections = 0, exchange_rejections = 0, successful_cancellations = 0;
-    OrderManager(const Task& task, Account initial) : task(task), account(initial) {
+    OrderManager(const Task& task, Account initial, Instrument specification = {}) : task(task), instrument(std::move(specification)), account(initial) {
+        instrument.validate();
         require(initial.cash >= 0 && initial.inventory >= 0 && task.target > 0 && (task.side == Side::Buy || task.side == Side::Sell), "Invalid manager task/account");
     }
     const std::map<ull, OrderState>& orders() const { return tracked; }
@@ -198,11 +195,14 @@ public:
         require(id > 0 && !tracked.count(id), "Strategy order ID already used");
         require(quantity > 0 && price > 0 && side == task.side, "Invalid local order request");
         // Compute everything before committing a reservation or sending a request.
-        const bool representable = price <= MAX_PRICE && quantity <= MAX_QUANTITY;
-        const ll cash_reserve = side == Side::Buy && representable ? product(price, quantity) : 0;
+        ll cash_reserve = 0;
         const ll inventory_reserve = side == Side::Sell ? quantity : 0;
         std::string reason = prevalidation_error;
-        if (reason.empty() && !representable) reason = "instrument_bounds";
+        if (reason.empty()) {
+            try { instrument.validateOrder(price, quantity); if (side == Side::Buy) cash_reserve = product(price, quantity); }
+            catch (const std::invalid_argument& error) { reason = error.what(); }
+            catch (const std::overflow_error& error) { reason = error.what(); }
+        }
         if (reason.empty() && price != task.limit_price) reason = "task_limit_mismatch";
         if (reason.empty() && quantity > task.target - executed - potentiallyExecutable()) reason = "task_target_overcommitment";
         if (reason.empty() && cash_reserve > availableCash()) reason = "insufficient_available_cash";
@@ -210,7 +210,7 @@ public:
         if (reason.empty()) {
             try {
                 if (side == Side::Buy) add(account.inventory, add(potentiallyExecutable(), quantity));
-                else add(account.cash, product(MAX_PRICE, add(potentiallyExecutable(), quantity)));
+                else add(account.cash, product(instrument.maximumPrice(), add(potentiallyExecutable(), quantity)));
             } catch (const std::overflow_error& error) { reason = error.what(); }
         }
         OrderState state{id, side, price, quantity, 0, quantity};
@@ -240,7 +240,8 @@ public:
         auto& state = tracked.at(report.order_id);
         require(report.side == state.side && state.submission_sent, "Unexpected report side/submission");
         if (report.type == ReportType::Fill) {
-            require(report.execution_id > 0 && report.quantity > 0 && report.price > 0 && report.price <= MAX_PRICE, "Invalid fill");
+            require(report.execution_id > 0 && report.quantity > 0 && report.price > 0, "Invalid fill");
+            instrument.validateOrder(report.price, report.quantity);
             const auto seen = executions.find(report.execution_id);
             if (seen != executions.end()) {
                 const auto& prior = seen->second;
@@ -290,18 +291,21 @@ public:
 enum class PolicyKind { Immediate, Scheduled };
 struct PolicyConfig { PolicyKind kind = PolicyKind::Immediate; ll slices = 1; };
 struct Slice { Time time; ll quantity; };
-inline std::vector<Slice> slicePlan(const Task& task, ll count) {
-    require(task.target > 0 && count > 0 && count <= task.target && task.start >= 0 && task.deadline > task.start, "Invalid slice quantity/count/task");
+inline std::vector<Slice> slicePlan(const Task& task, ll count, const Instrument& instrument = {}) {
+    instrument.validate();
+    require(task.target > 0 && task.target % instrument.quantity_step_atoms == 0, "Task quantity is not step aligned");
+    const ll lots = task.target / instrument.quantity_step_atoms;
+    require(task.target > 0 && count > 0 && count <= lots && task.start >= 0 && task.deadline > task.start, "Invalid slice quantity/count/task");
     const Time duration = task.deadline - task.start;
     require(duration >= count, "Time window too short for distinct slice times");
-    const ll base_quantity = task.target / count, extra = task.target % count;
+    const ll base_quantity = lots / count, extra = lots % count;
     const Time step = duration / count, remainder = duration % count;
     // Increment quotient/remainder rather than multiplying i by duration.
     // carry + remainder is computed without overflow even at LLONG_MAX.
     Time offset = 0, carry = 0;
     std::vector<Slice> result;
     for (ll i = 0; i < count; ++i) {
-        result.push_back({add(task.start, offset), base_quantity + (i < extra ? 1 : 0)});
+        result.push_back({add(task.start, offset), product(base_quantity + (i < extra ? 1 : 0), instrument.quantity_step_atoms)});
         if (i + 1 < count) {
             offset = add(offset, step);
             if (remainder && carry >= count - remainder) { carry -= count - remainder; offset = add(offset, 1); }
@@ -325,19 +329,33 @@ struct Summary {
     ll submitted_orders, submitted_quantity, local_rejections, exchange_rejections;
     ll reserved_cash, reserved_inventory, successful_cancellations, unresolved_orders;
 };
-inline void writeSummary(std::ostream& out, const Summary& summary, const Task& task) {
-    out << "SUMMARY side=" << sideText(task.side) << " target=" << summary.target << " deadline_us=" << task.deadline
-        << " submitted_orders=" << summary.submitted_orders << " submitted_quantity=" << summary.submitted_quantity
+inline void writeSummary(std::ostream& out, const Summary& summary, const Task& task, const Instrument& instrument = {}) {
+    instrument.validate(); const bool legacy = instrument.legacyUnits();
+    const std::string quantity_suffix = legacy ? "" : "_atoms";
+    out << "SUMMARY side=" << sideText(task.side) << " target" << quantity_suffix << '=' << summary.target << " deadline_us=" << task.deadline
+        << " submitted_orders=" << summary.submitted_orders << " submitted_quantity" << quantity_suffix << '=' << summary.submitted_quantity
         << " local_rejections=" << summary.local_rejections << " exchange_rejections=" << summary.exchange_rejections
-        << " by_deadline=" << summary.by_deadline << " late=" << summary.late << " completed=" << summary.completed << " uncompleted=" << summary.uncompleted
-        << " state=" << outcomeText(summary.outcome) << " cash_paise=" << summary.cash << " inventory=" << summary.inventory << " executed_notional_paise=" << summary.notional
-        << " reserved_cash_paise=" << summary.reserved_cash << " reserved_inventory=" << summary.reserved_inventory
+        << " by_deadline" << quantity_suffix << '=' << summary.by_deadline << " late" << quantity_suffix << '=' << summary.late
+        << " completed" << quantity_suffix << '=' << summary.completed << " uncompleted" << quantity_suffix << '=' << summary.uncompleted
+        << " state=" << outcomeText(summary.outcome) << (legacy ? " cash_paise=" : " cash_atoms=") << summary.cash
+        << " inventory" << quantity_suffix << '=' << summary.inventory << (legacy ? " executed_notional_paise=" : " executed_notional_cash_atoms=") << summary.notional
+        << (legacy ? " reserved_cash_paise=" : " reserved_cash_atoms=") << summary.reserved_cash << " reserved_inventory" << quantity_suffix << '=' << summary.reserved_inventory
         << " successful_cancellations=" << summary.successful_cancellations << " unresolved_orders=" << summary.unresolved_orders;
-    if (!summary.completed) out << " average_price_paise=unavailable\n";
-    else out << " average_price_paise=" << summary.notional / summary.completed << " (floor display; exact ratio " << summary.notional << '/' << summary.completed << ")\n";
+    out << (legacy ? " average_price_paise=" : " average_price_atoms=");
+    if (!summary.completed) out << "unavailable\n";
+    else out << summary.notional / summary.completed << " (floor display; exact ratio " << summary.notional << '/' << summary.completed << ")\n";
+    if (!legacy) {
+        out << "VALUES cash=" << instrument.cashText(summary.cash) << ' ' << instrument.quote << " inventory=" << instrument.quantityText(summary.inventory) << ' ' << instrument.base
+            << " notional=" << instrument.cashText(summary.notional) << ' ' << instrument.quote << " reserved_cash=" << instrument.cashText(summary.reserved_cash)
+            << ' ' << instrument.quote << " average_price=";
+        if (!summary.completed) out << "unavailable";
+        else out << instrument.priceText(summary.notional / summary.completed) << ' ' << instrument.quote << '/' << instrument.base << " (floor to price atom; exact ratio above is in price atoms)";
+        out << '\n';
+    }
 }
 class Experiment {
     Task task;
+    Instrument instrument;
     Time request_delay, response_delay;
     PolicyConfig config;
     std::vector<Slice> slices;
@@ -356,12 +374,16 @@ class Experiment {
         trace << "trace_seq=" << ++trace_sequence << " event_seq=" << sequence << " exchange_us=";
         if (occurrence) trace << *occurrence; else trace << "NA";
         trace << " delivery_us=" << delivery << " type=" << type << " order=" << id << " execution=" << execution_id
-              << " price_paise=" << price << " quantity=" << quantity << " " << detail << '\n';
+              << (instrument.legacyUnits() ? " price_paise=" : " price_atoms=") << price << (instrument.legacyUnits() ? " quantity=" : " quantity_atoms=") << quantity << " " << detail << '\n';
     }
     std::string balances() const {
-        return " cash_paise=" + std::to_string(manager.account.cash) + " inventory=" + std::to_string(manager.account.inventory)
-            + " reserved_cash_paise=" + std::to_string(manager.reservedCash()) + " reserved_inventory=" + std::to_string(manager.reservedInventory())
-            + " task_executed=" + std::to_string(manager.executed) + " potentially_executable=" + std::to_string(manager.potentiallyExecutable());
+        const bool legacy = instrument.legacyUnits();
+        return std::string(legacy ? " cash_paise=" : " cash_atoms=") + std::to_string(manager.account.cash)
+            + (legacy ? " inventory=" : " inventory_atoms=") + std::to_string(manager.account.inventory)
+            + (legacy ? " reserved_cash_paise=" : " reserved_cash_atoms=") + std::to_string(manager.reservedCash())
+            + (legacy ? " reserved_inventory=" : " reserved_inventory_atoms=") + std::to_string(manager.reservedInventory())
+            + (legacy ? " task_executed=" : " task_executed_atoms=") + std::to_string(manager.executed)
+            + (legacy ? " potentially_executable=" : " potentially_executable_atoms=") + std::to_string(manager.potentiallyExecutable());
     }
     void emit(Report report) {
         report.delivery_time = delayed(report.exchange_time, response_delay);
@@ -372,7 +394,7 @@ class Experiment {
             detail << (report.strategy ? "strategy" : "external") << " reason=" << (report.reason.empty() ? "none" : report.reason);
             if (report.strategy) {
                 const auto& state = manager.order(report.order_id);
-                detail << " state=" << outcomeText(state.outcome) << " executed=" << state.executed << " remaining=" << state.remaining
+                detail << " state=" << outcomeText(state.outcome) << (instrument.legacyUnits() ? " executed=" : " executed_atoms=") << state.executed << (instrument.legacyUnits() ? " remaining=" : " remaining_atoms=") << state.remaining
                        << " cancel_pending=" << state.cancel_pending << balances() << " applied=" << applied;
             }
             log(sequence, report.exchange_time, now, reportText(report.type), report.order_id, report.execution_id, report.price, report.quantity, detail.str());
@@ -419,19 +441,19 @@ class Experiment {
         });
     }
 public:
-    Experiment(Task task, Account initial, Time request_delay = 0, Time response_delay = 0, PolicyConfig config = {}) :
-        task(task), request_delay(request_delay), response_delay(response_delay), config(config), first_strategy_id(ids.allocate()),
-        manager(task, initial), exchange([this](Report report) { emit(std::move(report)); }) {
+    Experiment(Task task, Account initial, Time request_delay = 0, Time response_delay = 0, PolicyConfig config = {}, Instrument specification = {}) :
+        task(task), instrument(std::move(specification)), request_delay(request_delay), response_delay(response_delay), config(config), first_strategy_id(ids.allocate()),
+        manager(task, initial, instrument), exchange([this](Report report) { emit(std::move(report)); }, instrument) {
         require((task.side == Side::Buy || task.side == Side::Sell) && task.target > 0 && task.limit_price > 0 && task.start >= 0 && task.deadline > task.start, "Invalid execution task");
         require(initial.cash >= 0 && initial.inventory >= 0 && request_delay >= 0 && response_delay >= 0, "Invalid account or delay");
         require(config.kind == PolicyKind::Immediate || config.kind == PolicyKind::Scheduled, "Unknown policy");
         require(config.slices > 0 && (config.kind != PolicyKind::Immediate || config.slices == 1), "Invalid policy slice count");
         delayed(delayed(task.deadline, request_delay), response_delay);
-        slices = slicePlan(task, config.kind == PolicyKind::Immediate ? 1 : config.slices);
+        slices = slicePlan(task, config.kind == PolicyKind::Immediate ? 1 : config.slices, instrument);
         try {
-            require(task.limit_price <= MAX_PRICE && task.target <= MAX_QUANTITY, "Task exceeds fictional instrument bounds");
+            instrument.validateOrder(task.limit_price, task.target);
             if (task.side == Side::Buy) { require(product(task.limit_price, task.target) <= initial.cash, "Insufficient cash at limit price"); add(initial.inventory, task.target); }
-            else { require(task.target <= initial.inventory, "Insufficient inventory"); add(initial.cash, product(MAX_PRICE, task.target)); }
+            else { require(task.target <= initial.inventory, "Insufficient inventory"); add(initial.cash, product(instrument.maximumPrice(), task.target)); }
         } catch (const std::invalid_argument& error) { local_error = error.what(); }
         catch (const std::overflow_error& error) { local_error = error.what(); }
     }
@@ -472,9 +494,14 @@ public:
     std::string run() {
         const Summary summary = finish();
         std::ostringstream result;
-        result << "instrument=WHOLE units=whole price/cash=paise time=microseconds zero_fees=1 request_delay_us=" << request_delay << " response_delay_us=" << response_delay
+        if (instrument.legacyUnits()) result << "instrument=WHOLE units=whole price/cash=paise time=microseconds zero_fees=1";
+        else result << "instrument=" << instrument.symbol << " base=" << instrument.base << " quote=" << instrument.quote
+                    << " price_decimals=" << instrument.price_decimals << " quantity_decimals=" << instrument.quantity_decimals << " cash_decimals=" << instrument.cashDecimals()
+                    << " price_tick_atoms=" << instrument.price_tick_atoms << " quantity_step_atoms=" << instrument.quantity_step_atoms
+                    << " time=microseconds zero_fees=1";
+        result << " request_delay_us=" << request_delay << " response_delay_us=" << response_delay
                << " policy=" << (config.kind == PolicyKind::Immediate ? "immediate" : "scheduled") << " slices=" << slices.size() << '\n' << eventTrace();
-        writeSummary(result, summary, task); return result.str();
+        writeSummary(result, summary, task, instrument); return result.str();
     }
 };
 inline std::string immediateDemo() {
