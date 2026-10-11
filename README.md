@@ -254,3 +254,356 @@ node test_dashboard_frontend.mjs dashboard/data/historical/btcusdt.json
 ```
 
 The frontend tests exercise the actual uploaded historical session's metric/depth/tape rendering, exact UTC/USDT/BTC formatting, unavailable initial book state, trade/snapshot separation, bounded table/log sizes, playback, invalid imports, and switching back to synthetic INR mode. They use a DOM fixture and **do not constitute browser layout or console verification**. Browser automation had no accessible browser during this milestone, so historical browser verification remains manual. Open the local view, step to the first snapshot, play/scrub/restart, compare the depth and tape with source CSV rows, switch back to an INR scenario, and check the browser console.
+
+## Historical market-making backtest
+
+`historical_backtest` is a deterministic **simulated** Binance spot BTCUSDT
+experiment. It reuses the historical CSV parser, provenance, exact price helpers,
+and shared capture-time merge; historical observations never enter the synthetic
+matching engine. The synthetic account and fixed-spread strategy remain unchanged.
+The new baseline buys at the latest observed best bid and sells at the latest
+observed best ask, with at most one active order per side.
+
+### Build and configure
+
+Requires GCC or Clang supporting checked signed 128-bit integers; no additional
+library or backend is needed.
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Wpedantic historical_backtest.cpp -o historical_backtest
+g++ -std=c++17 -Wall -Wextra -Wpedantic historical_backtest_tests.cpp -o historical_backtest_tests
+./historical_backtest --help
+```
+
+Required options are `--snapshots FILE --trades FILE --provenance FILE --output
+FILE`, in any order. Duplicate, unknown, incomplete, or invalid options fail.
+Optional parameters:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--order-size` | `0.001` | BTC per new order |
+| `--initial-cash` | `1000` | USDT |
+| `--initial-inventory` | `0.01` | BTC |
+| `--maximum-inventory` | `0.02` | BTC, including fully filled pending buys |
+| `--refresh-us` | `1000000` | Positive integer capture-time interval, microseconds |
+| `--maker-fee-bps` | `0` | Nonnegative hypothetical maker fee in basis points |
+
+Zero fees are a baseline assumption, **not a claim about Binance fees**. The
+second demonstration uses an explicitly hypothetical **1 bp**. No parameters
+were selected to manufacture fills or profit.
+
+### Execution, reservations, and exact arithmetic
+
+**Exact-price, trade-driven queue approximation; zero modeled order latency;
+no market impact.** Each event first applies the snapshot or eligible recorded
+trade to existing orders, then settles simulated fills/fees, then refreshes when
+due, then records the resulting state. Capture ties use the existing convention:
+snapshots before trades across streams, original row order within each stream.
+
+Quoting starts only with a valid two-sided snapshot. Refreshes are evaluated on
+arriving events; no scheduler, interpolation, or sleeping is used. New orders
+reserve the configured quantity and initialize queue ahead to the displayed
+quantity at that price. Unchanged quotes retain their queue and remaining
+quantity, including partial fills. Changed targets cancel and replace, losing
+priority. Completed orders replenish only when a refresh is due. Submission and
+cancellation happen instantaneously locally after observation, without true
+exchange arrival times.
+
+Only opposite-aggressor recorded trades at the **exact same price**, with capture
+time strictly after placement and exchange time strictly after the **maximum
+exchange timestamp observed through placement**, can consume queue ahead. The
+watermark is stored on each order. Equal-time, delayed earlier, wrong-side,
+unknown-side, and different-price records are ineligible. Eligible volume first
+consumes queue, then fills the remaining order, capped at its remaining quantity.
+A source trade is processed once; leftover volume cannot fill a newly replenished
+order. A 0.05 BTC queue and 0.01 BTC own order consume a 0.03 BTC trade without a
+fill, then a 0.025 BTC trade fills 0.005 BTC. Snapshots never reduce queue ahead,
+and unknown cancellations never improve priority.
+
+After **every snapshot**, a quote outside its corresponding visible top-five
+side or crossing the opposite best is cancelled with an inspectable reason.
+This is an explicit conservative coverage policy, not evidence that an exchange
+would have cancelled it. Recorded depth and trades remain unchanged.
+
+There is no borrowing or short selling. Sell inventory and buy cash including
+fees are reserved. Pending buys cannot exceed the inventory limit. Cash debits
+and credits use only simulated filled quantity; each fill charges its fee once.
+Buy reservations use the per-quantity-atom ceiling fee times remaining atoms,
+covering even maximally fragmented fills. Fees above 100% are supported when
+arithmetic permits: any sell fee liability exceeding proceeds is also reserved
+in cash; insufficient funding suppresses that quote.
+
+Numerical conventions:
+
+- Prices, BTC quantities, and basis-point fees: at most **8 decimal places**;
+  quantity/fee units fit a nonnegative signed 64-bit integer. Historical price
+  bounds remain unchanged. Order size must be positive; balances may be zero.
+- Cash settlement: **16 decimal places in USDT**. A price-times-quantity product
+  is exact at this scale. Cash inputs with greater precision fail.
+- Fee: `price × fill quantity × fee_bps / 10000`, **ceiling** to `10^-16 USDT`
+  separately for each fill. Fee multiplication uses checked 128-bit intermediates.
+- Inventory valuation: exact latest midpoint times inventory, **floor** to
+  `10^-16 USDT`. Midpoints retain the historical possible ninth decimal place.
+- Every wide addition and multiplication checks overflow. The symmetric supported
+  bound is `[-(2^127-1), 2^127-1]`; unsupported intermediate products fail even if
+  a later division might make them smaller. No binary floating-point accounting,
+  silent truncation of inputs, leverage, or negative spot inventory is allowed.
+
+Equity is cash plus inventory marked at the **latest available** midpoint. Before
+the first valid midpoint, equity and P&L are unavailable. Initial equity includes
+the initial BTC holding valued at that first midpoint. A later incomplete book
+retains the most recent available mark. Final P&L includes fees and is **marked,
+not realized**. Inventory and outstanding orders are reported without forced
+liquidation.
+
+### Tests and verified local runs
+
+```bash
+./historical_backtest_tests
+# Offline CLI/export/ledger fixtures; creates an ignored synthetic frontend export:
+PYTHONDONTWRITEBYTECODE=1 python3 test_historical_backtest.py
+# Offline dashboard regression and backtest fill inspector:
+node test_dashboard_frontend.mjs '' .local_data/backtest-fixture/result.json
+
+# First audit the existing provider CSVs (build historical_replay as above):
+PYTHONDONTWRITEBYTECODE=1 python3 test_historical.py \
+  --actual .local_data/binance-BTCUSDT/2024-01-01
+# Run both default and hypothetical 1-bp experiments, independent Decimal audit,
+# byte-identical repeated exports, and an explicitly unfunded zero-fill test:
+PYTHONDONTWRITEBYTECODE=1 python3 test_historical_backtest.py \
+  --actual .local_data/binance-BTCUSDT/2024-01-01
+node test_dashboard_frontend.mjs dashboard/data/historical/btcusdt.json \
+  .local_data/backtest-fixture/result.json dashboard/data/backtest
+```
+
+Tiny tracked `test_fixtures/backtest/` CSVs are **synthetic**, not provider data.
+C++ tests cover the queue example, partials, volume caps, duplicate records,
+ineligible aggressors/prices/timestamps, watermark regressions, snapshot
+non-consumption, coverage/crossing cancellation, replacement priority, unchanged
+partial quotes, scheduled replenishment, event-first handling of leftover volume,
+spot reserves/fees including extreme fees, nonzero initial holdings, rounding,
+precision, overflow, and pre-placement/post-cancellation non-fills. Prefix runs
+produce the same event states and fills as the corresponding prefix of a full
+run, excluding summary data. Python independently audits fee/cash/inventory/
+valuation and source checksums, tests errors and output preservation, and checks
+deterministic repeated exports. Frontend tests validate ledgers and confirm
+unavailable values, queue explanations, zero-fill results, backward stepping,
+no future fills, and switching among all three modes.
+
+The existing engine, simulator, market-maker, CLI replay, simulator CLI, synthetic
+export, historical parser/audit, and frontend regression suites passed. Browser
+automation returned no available browsers: **visual layout and browser-console
+checks remain manual**, and DOM tests do not substitute for them.
+
+Verified on the retained **2024-01-01 00:00–00:05 UTC capture window**, with 2429
+snapshots and 6357 recorded trades, using the default parameters above:
+
+| Result | Zero-fee baseline | Hypothetical 1 bp |
+| --- | ---: | ---: |
+| Initial marked equity · USDT | 1422.83585 | 1422.83585 |
+| Orders placed | 118 (80 buys / 38 sells) | 118 (80 buys / 38 sells) |
+| Cancellations | 104 | 104 |
+| Simulated fills | 14 (2 buys / 12 sells) | 14 (2 buys / 12 sells) |
+| Simulated volume · BTC | 0.01369 | 0.01369 |
+| Final inventory · BTC | 0.00031 | 0.00031 |
+| Fees · USDT | 0 | 0.0579234276 |
+| Final cash · USDT | 1409.819596 | 1409.7616725724 |
+| Final equity · USDT | 1422.96273575 | 1422.9048123224 |
+| Final marked P&L · USDT | 0.12688575 | 0.0689623224 |
+
+Both runs: buy volume 0.002 BTC, sell volume 0.01169 BTC, 13 completed orders,
+283 scheduled refreshes, 310 unchanged-quote retentions, and 138 sell risk skips.
+Cancellations: 57 outside visible depth, 36 crossing the opposite best, and 11
+scheduled target changes. Queue diagnostics count **trade/order attempts**, not
+unique trades: 2333 eligible, 558 different-price, 4497 wrong-aggressor, and 10
+exchange-watermark-ineligible attempts; 918 recorded trades had no active orders.
+Eligible trades consumed 63.02909 BTC of estimated queue across quote lifetimes.
+The final remaining buy is 0.001 BTC at 42397.22 USDT/BTC with 9.75209 BTC queue
+estimated ahead. Final reserved cash is 42.39722 USDT at zero fees and
+42.401459722 USDT at 1 bp; there is no active sell. The unfunded diagnostic run
+has zero orders/fills, zero equity/P&L, and valid playback.
+
+This five-minute exercise is an **integration experiment, not strategy
+validation**. Top-five snapshots cannot reveal individual-order priority;
+placements assume displayed volume ahead, cancellations do not improve it, and
+coverage cancellations discard quotes conservatively. Exact-price rules can
+underestimate fills and miss trade-through executions. True latency, market
+impact, exchange fee tiers, adverse-selection calibration, and liquidation costs
+are absent. Estimated strategy fills are never actual historical executions.
+
+### Generate and inspect playback
+
+The Python integration command generates local exports automatically. Equivalent
+explicit commands (after preparing the existing local CSVs):
+
+```bash
+mkdir -p dashboard/data/backtest
+./historical_backtest \
+  --snapshots .local_data/binance-BTCUSDT/2024-01-01/book_snapshot_5.csv \
+  --trades .local_data/binance-BTCUSDT/2024-01-01/trades.csv \
+  --provenance .local_data/binance-BTCUSDT/2024-01-01/provenance.csv \
+  --output dashboard/data/backtest/btcusdt-zero.json
+./historical_backtest \
+  --snapshots .local_data/binance-BTCUSDT/2024-01-01/book_snapshot_5.csv \
+  --trades .local_data/binance-BTCUSDT/2024-01-01/trades.csv \
+  --provenance .local_data/binance-BTCUSDT/2024-01-01/provenance.csv \
+  --maker-fee-bps 1 --output dashboard/data/backtest/btcusdt-1bp.json
+python3 -m http.server 8000 --bind 127.0.0.1 --directory dashboard
+```
+
+Open **http://localhost:8000** and select **Historical backtest · zero fees
+(local)** or **Historical backtest · hypothetical 1 bp (local)**. Upload is also
+supported. Step, play, scrub, and restart using the shared controls. The observed
+price lines have separate legends from orange simulated buys and purple simulated
+sells. The recorded trade tape remains separate from simulated fills. Expand a
+simulated fill to inspect source trade/event, placement and exchange watermark,
+queue before/after, quantity cap, fees, and account changes. Cash, inventory,
+reserves, equity, fees, P&L, orders, decisions, and inspectors use only the selected
+prefix. Parameters and execution assumptions appear above the portfolio and in
+export metadata. Final summary statistics are not exposed as current values.
+
+The distinct schema is `historical-backtest` version 1. `market` embeds the
+unchanged historical schema and checksum references, storing each market trade
+once. `states` aligns one-to-one with market events; `fills` and `lifecycle` store
+simulated fills and placement/cancellation/completion records once, referenced by
+string event indexes/order IDs. Each fill includes its source trade ID, capture
+and exchange timestamps, pre-fill order, queue calculation, price, fee, and signed
+cash/inventory changes. `parameters`, `conventions`, and `assumptions` document
+the run; `summary` includes counters, initial equity, volume, and final marked
+state. All monetary values, quantities, large IDs, and timestamps are strings;
+null valuations mean unavailable. The backtest supports at most 100000 events.
+Charts sample ordinary history but preserve quote transitions and missing-book
+boundaries; all events remain step-accessible. The latest 100 simulated fill
+inspectors are rendered. No cumulative histories are repeated inside states.
+
+Provider files, derived exports under `dashboard/data/backtest/`, and executables
+remain ignored/local. The executable carries the existing checksum references;
+the preparation cache and independent audit recompute them. No cryptographic
+hash implementation was duplicated in C++. Invalid configuration, precision,
+overflow, or input is rejected before opening output, and input aliases and
+output I/O failures return nonzero status. No commit, push, or deployment is part
+of this change.
+
+## Milestone A: controlled execution experiment
+
+This standalone, single-threaded C++17 experiment uses the existing `OrderBook`
+as a **controlled exchange for one fictional instrument**, named `WHOLE`.
+Prices and cash are integer **paise**, quantities are **whole units**, and
+simulated time is integer **microseconds**. It is not a BTC experiment and does
+not consume historical data. Fees are explicitly zero.
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Wpedantic execution_demo.cpp -o execution_demo
+g++ -std=c++17 -Wall -Wextra -Wpedantic execution_tests.cpp -o execution_tests
+./execution_tests
+./execution_demo             # both deterministic demonstrations
+./execution_demo immediate   # purchase only
+./execution_demo race        # cancellation race only
+```
+
+`execution/experiment.h` contains the compact vertical slice:
+
+- A validated `Task`: side, positive target quantity and limit, start, and a
+  strictly later deadline. `immediatePolicy` receives a delivered event kind and
+  a value-only local order view. It submits one bounded-limit order at start,
+  requests cancellation of an outstanding order at deadline, and never resubmits.
+  It has no book, scheduler, script, or exchange-truth access. There are no market
+  observations in this milestone because this policy needs only delivered timers
+  and order reports.
+- `Scheduler`: a priority queue ordered by `(delivery timestamp, insertion
+  sequence)`. Newly created same-time events go behind already queued peers.
+  Time never sleeps; past scheduling, negative time/delays, timestamp addition
+  overflow, and sequence exhaustion fail. External scripts are queued in caller
+  registration order before start/deadline timers. Strategy requests and responses
+  generated by those events join the same queue.
+- `Exchange`: the only component that mutates its private `OrderBook`. External
+  and strategy requests share an ID allocator; execution IDs identify actual
+  returned engine trades. Each submission reports acceptance **before individual
+  fills** at that occurrence time. Acceptance quantity is submitted quantity,
+  never accounted as execution. Both sides of returned trades receive reports,
+  so later external orders correctly fill resting strategy orders. Validation
+  failures produce rejections; cancellations report the removed remainder or an
+  explicit failure reason. Unexpected failures stop the experiment permanently;
+  engine mutation is not assumed transactional.
+- `OrderManager`: tracks request details, submission, acceptance knowledge,
+  executed/remaining quantities, cancellation requested/pending, cancelled
+  quantity, and terminal outcome. Cancellation pending coexists with fills; a
+  request itself never cancels an order. A cancellation rejection after a complete
+  fill cannot reopen it. The local account changes only when a fill report is
+  delivered. Identical execution duplicates are ignored; conflicting duplicates,
+  overfills, limit violations, negative balances, and terminal-state violations
+  fail clearly.
+- `Experiment`: connects policy actions to delayed exchange requests and delayed
+  reports, logs delivery, drains scheduled events, and requires a settled terminal
+  outcome and matching exchange/local completion. Request and response delays are
+  independently configurable nonnegative microseconds through its constructor.
+
+Task buying power is checked against **limit price × target quantity**; sells
+require inventory. All accounting multiplication/addition is checked. Adapter
+prices and individual quantities are bounded at `1,000,000,000` for this fictional
+instrument without changing the engine's public API. Buys must leave representable
+inventory. Sells reserve numerical headroom for proceeds at the adapter's maximum
+possible price, so a task can be rejected conservatively for representability.
+Negative accounts are unsupported. Funding/precision/bound failures are local
+order rejections before sending a strategy request; malformed task/time/account
+configuration throws before a run. Scripted counterparties are controlled
+liquidity, not separately funded portfolios.
+
+The deadline requests cancellation using the locally delivered state, even when
+the original acknowledgment has not arrived. The same fixed request delay for
+submission and cancellation preserves submission-before-cancellation arrival.
+Cancellation may lose a race. Completion **by deadline** uses exchange execution
+time `<= deadline`, regardless of report delivery time; later occurrences are
+reported separately. No end-of-loop liquidation or implicit cancellation occurs.
+An unresolved order, pending cancellation, or exchange/local mismatch fails
+instead of producing a successful summary.
+
+Trace rows contain a monotonic `trace_seq`, scheduler insertion `event_seq`,
+exchange occurrence time (`NA` for local timers/requests), delivery time, event
+type, order/execution ID, price, quantity, and applicable local state/account.
+Scheduler sequence values need not increase in delivery order across timestamps;
+equal-time delivery does follow their order. Exchange executions are available
+separately from locally observed balances. Average execution price is printed as
+an exact `notional/completed` ratio and an explicitly **floor-rounded display in
+paise**; zero fills display unavailable, with no division by zero.
+
+Hand-checkable demonstrations:
+
+| Result | A: bounded-limit purchase | B: cancellation race |
+| --- | ---: | ---: |
+| Target | 5 buys at limit 105 paise | 3 buys at limit 100 paise |
+| Request / response delay | 5 / 7 µs | 10 / 25 µs |
+| Deadline | 100 µs | 30 µs |
+| Engine executions | 2 at 100, 2 at 101, 1 at 103 | 3 at resting bid 100 |
+| Exchange execution time | 15 µs | 35 µs |
+| Local fill delivery | 22 µs | 60 µs |
+| Completed by deadline / late | 5 / 0 | 0 / 3 |
+| Final completed / uncompleted | 5 / 0 | 3 / 0 |
+| Final cash / inventory | 495 paise / 5 | 700 paise / 3 |
+| Execution notional | 505 paise | 300 paise |
+| Average execution price | 101 paise | 100 paise |
+
+Both start with 1000 paise and zero inventory. A seeds several genuine resting
+sell orders; best-price priority and a partial resting fill determine the result.
+B submits at 10 µs, arrives at 20 µs, requests cancellation at 30 µs before its
+acknowledgment is delivered at 45 µs, and fills against an external sell at 35 µs.
+Cancellation reaches the exchange at 40 µs and fails because the order is fully
+filled. Its rejection is delivered at 65 µs; the local filled state remains final.
+
+The eight focused execution test groups cover best prices/partials, both
+initiating sides, report-only accounting, resting remainder cancellation, full
+and partial cancellation races, after-cancellation non-fills, deadline before
+submission arrival/acknowledgment, pre-deadline execution reported late,
+post-deadline and equal-deadline classification, buy/sell validation and overflow,
+external cancellation/rejection, duplicate/conflicting fills, equal-time and
+zero-delay scheduling, invalid configuration/time arithmetic, and byte-identical
+repeated traces. Existing engine, simulator, CLI, historical, backtest, and
+frontend tests remain the regression checks documented above.
+
+This is one task, one strategy order/account, a FIFO/price-priority controlled
+engine, and fixed deterministic delays. It models neither real-venue fidelity,
+network jitter, exchange-specific protocols, fees, general portfolio reservations,
+nor historical precision. No threads, services, frontend schema, TWAP, live
+adapter, historical integration, or additional policy is introduced. Executables
+are ignored. Previous historical/backtest/dashboard edits and unrelated artifacts
+are preserved; this milestone does not commit or publish them.

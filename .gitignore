@@ -15,3 +15,12 @@ market_maker_tests
 /.local_data/
 /dashboard/data/historical/
 historical_replay
+
+# Local historical backtest outputs and executables.
+/dashboard/data/backtest/
+historical_backtest
+historical_backtest_tests
+
+# Controlled execution experiment executables.
+execution_demo
+execution_tests
