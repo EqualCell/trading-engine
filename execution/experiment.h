@@ -142,7 +142,7 @@ public:
         send(ReportType::Cancelled, request->second, time, active->remaining_qty);
     }
 };
-enum class Outcome { Pending, Working, Filled, Cancelled, Rejected };
+enum class Outcome { Pending, Working, Filled, Cancelled, Rejected, Incomplete };
 inline const char* outcomeText(Outcome outcome) {
     switch (outcome) {
         case Outcome::Pending: return "pending";
@@ -150,6 +150,7 @@ inline const char* outcomeText(Outcome outcome) {
         case Outcome::Filled: return "filled";
         case Outcome::Cancelled: return "cancelled";
         case Outcome::Rejected: return "rejected";
+        case Outcome::Incomplete: return "incomplete";
     }
     throw std::logic_error("Unknown outcome");
 }
@@ -158,22 +159,86 @@ struct OrderState {
     bool submission_sent = false, acceptance_known = false, cancel_requested = false, cancel_pending = false;
     Outcome outcome = Outcome::Pending;
     ll cancelled = 0;
+    ll reserved_cash = 0, reserved_inventory = 0;
+    bool rejection_known = false;
+    std::string rejection_reason = "";
 };
+struct Submission { bool accepted; std::string reason; };
 class OrderManager {
+    Task task;
+    std::map<ull, OrderState> tracked;
     std::unordered_map<ull, Report> executions;
+    ll reserved_cash_total = 0, reserved_inventory_total = 0;
+    void validateExposure() const {
+        require(executed >= 0 && potentiallyExecutable() <= task.target - executed, "Task exposure invariant failed");
+        require(reserved_cash_total >= 0 && reserved_cash_total <= account.cash && reserved_inventory_total >= 0 && reserved_inventory_total <= account.inventory, "Reservation invariant failed");
+    }
 public:
-    OrderState order;
     Account account;
-    ll notional = 0;
-    OrderManager(ull id, const Task& task, Account initial) :
-        order{id, task.side, task.limit_price, task.target, 0, task.target}, account(initial) {}
-    bool outstanding() const { return order.submission_sent && order.remaining > 0 && order.outcome != Outcome::Rejected; }
-    void rejectLocal() { order.outcome = Outcome::Rejected; order.remaining = 0; }
-    void submitted() { require(!order.submission_sent, "Duplicate strategy submission"); order.submission_sent = true; }
-    void requestCancel() { require(outstanding() && !order.cancel_requested, "Invalid cancellation request"); order.cancel_requested = order.cancel_pending = true; }
-    // Return false for an identical fill duplicate. Delivery timestamp can differ.
+    ll notional = 0, executed = 0, submitted_quantity = 0;
+    ll submitted_orders = 0, local_rejections = 0, exchange_rejections = 0, successful_cancellations = 0;
+    OrderManager(const Task& task, Account initial) : task(task), account(initial) {
+        require(initial.cash >= 0 && initial.inventory >= 0 && task.target > 0 && (task.side == Side::Buy || task.side == Side::Sell), "Invalid manager task/account");
+    }
+    const std::map<ull, OrderState>& orders() const { return tracked; }
+    const OrderState& order(ull id) const { return tracked.at(id); }
+    ll reservedCash() const { return reserved_cash_total; }
+    ll reservedInventory() const { return reserved_inventory_total; }
+    ll availableCash() const { return account.cash - reserved_cash_total; }
+    ll availableInventory() const { return account.inventory - reserved_inventory_total; }
+    ll potentiallyExecutable() const {
+        ll total = 0;
+        for (const auto& pair : tracked) if (pair.second.submission_sent) total = add(total, pair.second.remaining);
+        return total;
+    }
+    bool outstanding(ull id) const { const auto& o = order(id); return o.submission_sent && (o.remaining > 0 || o.cancel_pending); }
+    bool outstanding() const { for (const auto& pair : tracked) if (outstanding(pair.first)) return true; return false; }
+    ll unresolvedOrders() const { ll count = 0; for (const auto& pair : tracked) if (outstanding(pair.first)) ++count; return count; }
+    Submission submit(ull id, Side side, ll price, ll quantity, const std::string& prevalidation_error = "") {
+        require(id > 0 && !tracked.count(id), "Strategy order ID already used");
+        require(quantity > 0 && price > 0 && side == task.side, "Invalid local order request");
+        // Compute everything before committing a reservation or sending a request.
+        const bool representable = price <= MAX_PRICE && quantity <= MAX_QUANTITY;
+        const ll cash_reserve = side == Side::Buy && representable ? product(price, quantity) : 0;
+        const ll inventory_reserve = side == Side::Sell ? quantity : 0;
+        std::string reason = prevalidation_error;
+        if (reason.empty() && !representable) reason = "instrument_bounds";
+        if (reason.empty() && price != task.limit_price) reason = "task_limit_mismatch";
+        if (reason.empty() && quantity > task.target - executed - potentiallyExecutable()) reason = "task_target_overcommitment";
+        if (reason.empty() && cash_reserve > availableCash()) reason = "insufficient_available_cash";
+        if (reason.empty() && inventory_reserve > availableInventory()) reason = "insufficient_available_inventory";
+        if (reason.empty()) {
+            try {
+                if (side == Side::Buy) add(account.inventory, add(potentiallyExecutable(), quantity));
+                else add(account.cash, product(MAX_PRICE, add(potentiallyExecutable(), quantity)));
+            } catch (const std::overflow_error& error) { reason = error.what(); }
+        }
+        OrderState state{id, side, price, quantity, 0, quantity};
+        if (!reason.empty()) {
+            state.outcome = Outcome::Rejected; state.remaining = 0;
+            state.rejection_known = true; state.rejection_reason = reason;
+            const ll next_rejections = add(local_rejections, 1);
+            tracked.emplace(id, std::move(state)); local_rejections = next_rejections;
+            return {false, reason};
+        }
+        const ll next_cash_reserve = add(reserved_cash_total, cash_reserve);
+        const ll next_inventory_reserve = add(reserved_inventory_total, inventory_reserve);
+        const ll next_submitted = add(submitted_quantity, quantity), next_orders = add(submitted_orders, 1);
+        state.submission_sent = true; state.reserved_cash = cash_reserve; state.reserved_inventory = inventory_reserve;
+        tracked.emplace(id, std::move(state));
+        reserved_cash_total = next_cash_reserve; reserved_inventory_total = next_inventory_reserve;
+        submitted_quantity = next_submitted; submitted_orders = next_orders; validateExposure();
+        return {true, ""};
+    }
+    void requestCancel(ull id) {
+        auto& state = tracked.at(id);
+        require(state.submission_sent && state.remaining > 0 && !state.cancel_requested, "Invalid cancellation request");
+        state.cancel_requested = state.cancel_pending = true; validateExposure();
+    }
     bool receive(const Report& report) {
-        require(report.strategy && report.order_id == order.id && report.side == order.side && report.exchange_time >= 0 && report.delivery_time >= report.exchange_time, "Unexpected order report identity/time");
+        require(report.strategy && tracked.count(report.order_id) && report.exchange_time >= 0 && report.delivery_time >= report.exchange_time, "Unexpected order report identity/time");
+        auto& state = tracked.at(report.order_id);
+        require(report.side == state.side && state.submission_sent, "Unexpected report side/submission");
         if (report.type == ReportType::Fill) {
             require(report.execution_id > 0 && report.quantity > 0 && report.price > 0 && report.price <= MAX_PRICE, "Invalid fill");
             const auto seen = executions.find(report.execution_id);
@@ -181,66 +246,122 @@ public:
                 const auto& prior = seen->second;
                 require(prior.order_id == report.order_id && prior.side == report.side && prior.quantity == report.quantity && prior.price == report.price && prior.exchange_time == report.exchange_time, "Conflicting duplicate execution report"); return false;
             }
-            require(order.submission_sent && report.quantity <= order.remaining && order.outcome != Outcome::Cancelled && order.outcome != Outcome::Rejected, "Fill after terminal outcome or overfill");
-            require(order.side == Side::Buy ? report.price <= order.price : report.price >= order.price, "Fill violates limit price");
+            require(report.quantity <= state.remaining && state.outcome != Outcome::Cancelled && state.outcome != Outcome::Rejected, "Fill after terminal outcome or overfill");
+            require(state.side == Side::Buy ? report.price <= state.price : report.price >= state.price, "Fill violates limit price");
             const ll amount = product(report.price, report.quantity);
-            const Account next{add(account.cash, order.side == Side::Buy ? -amount : amount), add(account.inventory, order.side == Side::Buy ? report.quantity : -report.quantity)};
-            require(next.cash >= 0 && next.inventory >= 0, "Spot account invariant failed");
-            const ll next_notional = add(notional, amount);
+            const Account next{add(account.cash, state.side == Side::Buy ? -amount : amount), add(account.inventory, state.side == Side::Buy ? report.quantity : -report.quantity)};
+            const ll cash_release = state.side == Side::Buy ? product(state.price, report.quantity) : 0;
+            const ll inventory_release = state.side == Side::Sell ? report.quantity : 0;
+            const ll next_notional = add(notional, amount), next_executed = add(executed, report.quantity);
+            require(next.cash >= 0 && next.inventory >= 0 && cash_release <= state.reserved_cash && inventory_release <= state.reserved_inventory && next_executed <= task.target, "Fill/account/reservation invariant failed");
             executions.emplace(report.execution_id, report);
-            account = next; notional = next_notional;
-            order.executed = add(order.executed, report.quantity); order.remaining -= report.quantity;
-            order.outcome = order.remaining ? Outcome::Working : Outcome::Filled;
+            account = next; notional = next_notional; executed = next_executed;
+            state.executed = add(state.executed, report.quantity); state.remaining -= report.quantity;
+            state.reserved_cash -= cash_release; state.reserved_inventory -= inventory_release;
+            reserved_cash_total -= cash_release; reserved_inventory_total -= inventory_release;
+            state.outcome = state.remaining ? Outcome::Working : Outcome::Filled;
         } else if (report.type == ReportType::Accepted) {
-            require(order.submission_sent && report.quantity == order.submitted && report.price == order.price && order.outcome != Outcome::Rejected, "Invalid acceptance");
-            order.acceptance_known = true;
-            if (order.outcome == Outcome::Pending) order.outcome = Outcome::Working;
+            require(report.quantity == state.submitted && report.price == state.price && state.outcome != Outcome::Rejected, "Invalid acceptance");
+            state.acceptance_known = true;
+            if (state.outcome == Outcome::Pending) state.outcome = Outcome::Working;
         } else if (report.type == ReportType::Rejected) {
-            require(order.executed == 0 && !order.acceptance_known, "Rejection after acceptance or fill");
-            order.outcome = Outcome::Rejected; order.remaining = 0;
+            if (state.rejection_known) { require(state.rejection_reason == report.reason, "Conflicting duplicate rejection"); return false; }
+            require(state.executed == 0 && !state.acceptance_known && state.outcome == Outcome::Pending, "Rejection after acceptance or fill");
+            const ll next_rejections = add(exchange_rejections, 1);
+            reserved_cash_total -= state.reserved_cash; reserved_inventory_total -= state.reserved_inventory;
+            state.reserved_cash = state.reserved_inventory = 0; state.remaining = 0;
+            state.outcome = Outcome::Rejected; state.rejection_known = true; state.rejection_reason = report.reason; exchange_rejections = next_rejections;
+            // Keep a pending cancellation until its own response settles.
         } else if (report.type == ReportType::Cancelled) {
-            require(order.cancel_pending && report.quantity > 0 && report.quantity == order.remaining, "Invalid cancellation quantity/state");
-            order.cancelled = report.quantity; order.remaining = 0; order.cancel_pending = false; order.outcome = Outcome::Cancelled;
+            if (state.outcome == Outcome::Cancelled) { require(report.quantity == state.cancelled, "Conflicting duplicate cancellation"); return false; }
+            require(state.cancel_pending && report.quantity > 0 && report.quantity == state.remaining, "Invalid cancellation quantity/state");
+            const ll next_cancellations = add(successful_cancellations, 1);
+            reserved_cash_total -= state.reserved_cash; reserved_inventory_total -= state.reserved_inventory;
+            state.reserved_cash = state.reserved_inventory = 0; state.cancelled = report.quantity; state.remaining = 0;
+            state.cancel_pending = false; state.outcome = Outcome::Cancelled; successful_cancellations = next_cancellations;
         } else {
-            require(report.type == ReportType::CancelRejected && order.cancel_pending, "Unexpected cancellation rejection");
-            order.cancel_pending = false; // A terminal full fill stays terminal.
+            require(report.type == ReportType::CancelRejected && state.cancel_pending, "Unexpected cancellation rejection");
+            state.cancel_pending = false; // No reservation release on failed cancel.
         }
-        require(order.executed >= 0 && order.executed <= order.submitted && order.remaining >= 0 && order.remaining <= order.submitted - order.executed, "Order quantity invariant failed");
-        return true;
+        require(state.executed >= 0 && state.executed <= state.submitted && state.remaining >= 0 && state.remaining <= state.submitted - state.executed, "Order quantity invariant failed");
+        validateExposure(); return true;
     }
 };
-enum class PolicyEvent { Start, Deadline, OrderReport };
+enum class PolicyKind { Immediate, Scheduled };
+struct PolicyConfig { PolicyKind kind = PolicyKind::Immediate; ll slices = 1; };
+struct Slice { Time time; ll quantity; };
+inline std::vector<Slice> slicePlan(const Task& task, ll count) {
+    require(task.target > 0 && count > 0 && count <= task.target && task.start >= 0 && task.deadline > task.start, "Invalid slice quantity/count/task");
+    const Time duration = task.deadline - task.start;
+    require(duration >= count, "Time window too short for distinct slice times");
+    const ll base_quantity = task.target / count, extra = task.target % count;
+    const Time step = duration / count, remainder = duration % count;
+    // Increment quotient/remainder rather than multiplying i by duration.
+    // carry + remainder is computed without overflow even at LLONG_MAX.
+    Time offset = 0, carry = 0;
+    std::vector<Slice> result;
+    for (ll i = 0; i < count; ++i) {
+        result.push_back({add(task.start, offset), base_quantity + (i < extra ? 1 : 0)});
+        if (i + 1 < count) {
+            offset = add(offset, step);
+            if (remainder && carry >= count - remainder) { carry -= count - remainder; offset = add(offset, 1); }
+            else carry += remainder;
+        }
+    }
+    return result;
+}
+enum class PolicyEvent { Start, SliceTimer, Deadline, OrderReport };
 enum class Action { None, Submit, Cancel };
-// Value-only local view; no scheduler, book, exchange truth, or script access.
-struct PolicyView { bool submitted, outstanding, cancel_requested; };
-inline Action immediatePolicy(PolicyEvent event, const PolicyView& view) {
-    if (event == PolicyEvent::Start && !view.submitted) return Action::Submit;
-    if (event == PolicyEvent::Deadline && view.outstanding && !view.cancel_requested) return Action::Cancel;
+struct PolicyView { bool deadline_reached; ll due_quantity; };
+// The policy sees only delivered timer/report kinds and local values.
+inline Action boundedPolicy(PolicyEvent event, const PolicyView& view) {
+    if ((event == PolicyEvent::Start || event == PolicyEvent::SliceTimer) && !view.deadline_reached && view.due_quantity > 0) return Action::Submit;
+    if (event == PolicyEvent::Deadline) return Action::Cancel;
     return Action::None;
 }
 struct Summary {
     ll target, by_deadline, late, completed, uncompleted, cash, inventory, notional;
     Outcome outcome;
+    ll submitted_orders, submitted_quantity, local_rejections, exchange_rejections;
+    ll reserved_cash, reserved_inventory, successful_cancellations, unresolved_orders;
 };
+inline void writeSummary(std::ostream& out, const Summary& summary, const Task& task) {
+    out << "SUMMARY side=" << sideText(task.side) << " target=" << summary.target << " deadline_us=" << task.deadline
+        << " submitted_orders=" << summary.submitted_orders << " submitted_quantity=" << summary.submitted_quantity
+        << " local_rejections=" << summary.local_rejections << " exchange_rejections=" << summary.exchange_rejections
+        << " by_deadline=" << summary.by_deadline << " late=" << summary.late << " completed=" << summary.completed << " uncompleted=" << summary.uncompleted
+        << " state=" << outcomeText(summary.outcome) << " cash_paise=" << summary.cash << " inventory=" << summary.inventory << " executed_notional_paise=" << summary.notional
+        << " reserved_cash_paise=" << summary.reserved_cash << " reserved_inventory=" << summary.reserved_inventory
+        << " successful_cancellations=" << summary.successful_cancellations << " unresolved_orders=" << summary.unresolved_orders;
+    if (!summary.completed) out << " average_price_paise=unavailable\n";
+    else out << " average_price_paise=" << summary.notional / summary.completed << " (floor display; exact ratio " << summary.notional << '/' << summary.completed << ")\n";
+}
 class Experiment {
     Task task;
     Time request_delay, response_delay;
+    PolicyConfig config;
+    std::vector<Slice> slices;
     Ids ids;
+    ull first_strategy_id;
     Scheduler scheduler;
     OrderManager manager;
     Exchange exchange;
+    std::set<ull> external_ids;
     std::ostringstream trace;
-    bool initialized = false, deadline_delivered = false, failed = false;
+    bool initialized = false, deadline_delivered = false, failed = false, first_submission = true;
     ull trace_sequence = 0;
     std::string local_error;
-    // Trace seq is scheduler insertion sequence, not a second report chronology.
     void log(ull sequence, std::optional<Time> occurrence, Time delivery, const std::string& type, ull id, ull execution_id, ll price, ll quantity, const std::string& detail) {
         if (trace_sequence == std::numeric_limits<ull>::max()) throw std::overflow_error("Trace sequence exhausted");
         trace << "trace_seq=" << ++trace_sequence << " event_seq=" << sequence << " exchange_us=";
         if (occurrence) trace << *occurrence; else trace << "NA";
-        trace << " delivery_us=" << delivery
-              << " type=" << type << " order=" << id << " execution=" << execution_id
+        trace << " delivery_us=" << delivery << " type=" << type << " order=" << id << " execution=" << execution_id
               << " price_paise=" << price << " quantity=" << quantity << " " << detail << '\n';
+    }
+    std::string balances() const {
+        return " cash_paise=" + std::to_string(manager.account.cash) + " inventory=" + std::to_string(manager.account.inventory)
+            + " reserved_cash_paise=" + std::to_string(manager.reservedCash()) + " reserved_inventory=" + std::to_string(manager.reservedInventory())
+            + " task_executed=" + std::to_string(manager.executed) + " potentially_executable=" + std::to_string(manager.potentiallyExecutable());
     }
     void emit(Report report) {
         report.delivery_time = delayed(report.exchange_time, response_delay);
@@ -249,75 +370,87 @@ class Experiment {
             if (report.strategy) applied = manager.receive(report);
             std::ostringstream detail;
             detail << (report.strategy ? "strategy" : "external") << " reason=" << (report.reason.empty() ? "none" : report.reason);
-            if (report.strategy) detail << " state=" << outcomeText(manager.order.outcome) << " executed=" << manager.order.executed << " remaining=" << manager.order.remaining
-                                       << " cancel_pending=" << manager.order.cancel_pending << " cash_paise=" << manager.account.cash << " inventory=" << manager.account.inventory << " applied=" << applied;
+            if (report.strategy) {
+                const auto& state = manager.order(report.order_id);
+                detail << " state=" << outcomeText(state.outcome) << " executed=" << state.executed << " remaining=" << state.remaining
+                       << " cancel_pending=" << state.cancel_pending << balances() << " applied=" << applied;
+            }
             log(sequence, report.exchange_time, now, reportText(report.type), report.order_id, report.execution_id, report.price, report.quantity, detail.str());
-            policy(PolicyEvent::OrderReport, now, sequence);
+            policy(PolicyEvent::OrderReport, now, sequence, 0);
         });
     }
-    void policy(PolicyEvent event, Time now, ull sequence) {
-        const Action action = immediatePolicy(event, {manager.order.submission_sent, manager.outstanding(), manager.order.cancel_requested});
+    void policy(PolicyEvent event, Time now, ull sequence, ll due_quantity) {
+        const Action action = boundedPolicy(event, {deadline_delivered || now >= task.deadline, due_quantity});
         if (action == Action::Submit) {
-            if (!local_error.empty()) { manager.rejectLocal(); log(sequence, std::nullopt, now, "local_rejection", manager.order.id, 0, task.limit_price, task.target, local_error); return; }
-            const Order order{manager.order.id, task.side, task.limit_price, task.target};
-            manager.submitted();
-            log(sequence, std::nullopt, now, "submit_request", order.id, 0, order.price, order.remaining_qty, "local account unchanged; exchange arrival pending");
+            const ull id = first_submission ? first_strategy_id : ids.allocate(); first_submission = false;
+            const Submission result = manager.submit(id, task.side, task.limit_price, due_quantity, local_error);
+            if (!result.accepted) { log(sequence, std::nullopt, now, "local_rejection", id, 0, task.limit_price, due_quantity, result.reason + balances()); return; }
+            const Order order{id, task.side, task.limit_price, due_quantity};
+            log(sequence, std::nullopt, now, "submit_request", id, 0, order.price, order.remaining_qty, "reservation applied; account unchanged" + balances());
             scheduler.schedule(delayed(now, request_delay), [this, order](Time time, ull seq) {
                 log(seq, time, time, "submit_arrival", order.id, 0, order.price, order.remaining_qty, "strategy"); exchange.submit(order, true, time);
             });
         } else if (action == Action::Cancel) {
-            manager.requestCancel();
-            log(sequence, std::nullopt, now, "cancel_request", manager.order.id, 0, task.limit_price, manager.order.remaining, "cancel_pending=1; order not cancelled");
-            scheduler.schedule(delayed(now, request_delay), [this](Time time, ull seq) {
-                log(seq, time, time, "cancel_arrival", manager.order.id, 0, task.limit_price, 0, "strategy"); exchange.cancel(manager.order.id, true, time);
-            });
+            for (const auto& pair : manager.orders()) {
+                const ull id = pair.first; const auto& state = pair.second;
+                if (!state.submission_sent || state.remaining == 0 || state.cancel_requested) continue;
+                manager.requestCancel(id);
+                log(sequence, std::nullopt, now, "cancel_request", id, 0, state.price, state.remaining, "cancel_pending=1; reservations retained" + balances());
+                scheduler.schedule(delayed(now, request_delay), [this, id](Time time, ull seq) {
+                    log(seq, time, time, "cancel_arrival", id, 0, task.limit_price, 0, "strategy"); exchange.cancel(id, true, time);
+                });
+            }
         }
     }
     void initialize() {
         if (initialized) return;
         initialized = true;
-        // Script is queued before timers. Equal-time order follows insertion order,
-        // including same-time requests/reports created by a timer or exchange event.
+        // Queue common script events and common timers identically for both policies.
+        // Policy-only extra slice timers follow them; same-time children remain FIFO.
         scheduler.schedule(task.start, [this](Time time, ull seq) {
-            log(seq, std::nullopt, time, "task_start", manager.order.id, 0, task.limit_price, task.target, "policy delivered timer"); policy(PolicyEvent::Start, time, seq);
+            log(seq, std::nullopt, time, "task_start", first_strategy_id, 0, task.limit_price, task.target, "policy delivered timer"); policy(PolicyEvent::Start, time, seq, slices[0].quantity);
         });
         scheduler.schedule(task.deadline, [this](Time time, ull seq) {
             deadline_delivered = true;
-            log(seq, std::nullopt, time, "deadline", manager.order.id, 0, task.limit_price, manager.order.remaining, "policy delivered timer"); policy(PolicyEvent::Deadline, time, seq);
+            log(seq, std::nullopt, time, "deadline", 0, 0, task.limit_price, manager.potentiallyExecutable(), "policy delivered timer"); policy(PolicyEvent::Deadline, time, seq, 0);
+        });
+        for (std::size_t i = 1; i < slices.size(); ++i) scheduler.schedule(slices[i].time, [this, quantity = slices[i].quantity](Time time, ull seq) {
+            log(seq, std::nullopt, time, "slice_timer", 0, 0, task.limit_price, quantity, "policy delivered timer"); policy(PolicyEvent::SliceTimer, time, seq, quantity);
         });
     }
 public:
-    Experiment(Task task, Account initial, Time request_delay = 0, Time response_delay = 0) :
-        task(task), request_delay(request_delay), response_delay(response_delay),
-        manager(ids.allocate(), task, initial), exchange([this](Report report) { emit(std::move(report)); }) {
+    Experiment(Task task, Account initial, Time request_delay = 0, Time response_delay = 0, PolicyConfig config = {}) :
+        task(task), request_delay(request_delay), response_delay(response_delay), config(config), first_strategy_id(ids.allocate()),
+        manager(task, initial), exchange([this](Report report) { emit(std::move(report)); }) {
         require((task.side == Side::Buy || task.side == Side::Sell) && task.target > 0 && task.limit_price > 0 && task.start >= 0 && task.deadline > task.start, "Invalid execution task");
         require(initial.cash >= 0 && initial.inventory >= 0 && request_delay >= 0 && response_delay >= 0, "Invalid account or delay");
-        // All task-generated request/report times must be representable before mutation.
+        require(config.kind == PolicyKind::Immediate || config.kind == PolicyKind::Scheduled, "Unknown policy");
+        require(config.slices > 0 && (config.kind != PolicyKind::Immediate || config.slices == 1), "Invalid policy slice count");
         delayed(delayed(task.deadline, request_delay), response_delay);
+        slices = slicePlan(task, config.kind == PolicyKind::Immediate ? 1 : config.slices);
         try {
             require(task.limit_price <= MAX_PRICE && task.target <= MAX_QUANTITY, "Task exceeds fictional instrument bounds");
             if (task.side == Side::Buy) { require(product(task.limit_price, task.target) <= initial.cash, "Insufficient cash at limit price"); add(initial.inventory, task.target); }
             else { require(task.target <= initial.inventory, "Insufficient inventory"); add(initial.cash, product(MAX_PRICE, task.target)); }
-        } catch (const std::exception& error) { local_error = error.what(); }
+        } catch (const std::invalid_argument& error) { local_error = error.what(); }
+        catch (const std::overflow_error& error) { local_error = error.what(); }
     }
     Experiment(const Experiment&) = delete;
     Experiment& operator=(const Experiment&) = delete;
     ull externalOrder(Time arrival, Side side, ll price, ll quantity) {
-        require(!initialized, "Script must be registered before starting");
-        delayed(arrival, response_delay); // Reject invalid/overflowing report times before engine mutation.
-        const ull id = ids.allocate();
+        require(!initialized, "Script must be registered before starting"); delayed(arrival, response_delay);
+        const ull id = ids.allocate(); external_ids.insert(id);
         scheduler.schedule(arrival, [this, order = Order{id, side, price, quantity}](Time time, ull seq) {
             log(seq, time, time, "external_submit", order.id, 0, order.price, order.remaining_qty, "script arrival"); exchange.submit(order, false, time);
         }); return id;
     }
     void externalCancel(Time arrival, ull id) {
-        require(!initialized && id != manager.order.id, "Invalid external cancellation script"); delayed(arrival, response_delay);
+        require(!initialized && external_ids.count(id), "External cancellation must use a registered external ID"); delayed(arrival, response_delay);
         scheduler.schedule(arrival, [this, id](Time time, ull seq) { log(seq, time, time, "external_cancel", id, 0, 0, 0, "script arrival"); exchange.cancel(id, false, time); });
     }
     bool step() {
         require(!failed, "Failed experiment cannot resume");
-        try { initialize(); return scheduler.step(); }
-        catch (...) { failed = true; throw; }
+        try { initialize(); return scheduler.step(); } catch (...) { failed = true; throw; }
     }
     const OrderManager& local() const { return manager; }
     const std::vector<Execution>& exchangeExecutions() const { return exchange.truth; }
@@ -325,24 +458,23 @@ public:
     Summary finish() {
         require(!failed, "Failed experiment cannot resume");
         try { initialize(); scheduler.drain(); } catch (...) { failed = true; throw; }
-        if (!deadline_delivered || manager.order.cancel_pending || manager.outstanding() ||
-            (manager.order.outcome != Outcome::Filled && manager.order.outcome != Outcome::Cancelled && manager.order.outcome != Outcome::Rejected)) { failed = true; throw std::runtime_error("Execution experiment failed to settle"); }
+        if (!deadline_delivered || manager.outstanding() || manager.reservedCash() || manager.reservedInventory()) { failed = true; throw std::runtime_error("Execution experiment failed to settle"); }
         ll before = 0, after = 0;
-        for (const auto& fill : exchange.truth) {
-            if (fill.time <= task.deadline) before = add(before, fill.quantity); else after = add(after, fill.quantity);
-        }
-        if (add(before, after) != manager.order.executed) { failed = true; throw std::runtime_error("Exchange/local completion mismatch"); }
-        return {task.target, before, after, manager.order.executed, task.target - manager.order.executed, manager.account.cash, manager.account.inventory, manager.notional, manager.order.outcome};
+        for (const auto& fill : exchange.truth) { if (fill.time <= task.deadline) before = add(before, fill.quantity); else after = add(after, fill.quantity); }
+        if (add(before, after) != manager.executed) { failed = true; throw std::runtime_error("Exchange/local completion mismatch"); }
+        bool all_rejected = true;
+        for (const auto& pair : manager.orders()) if (pair.second.outcome != Outcome::Rejected) all_rejected = false;
+        const Outcome outcome = manager.executed == task.target ? Outcome::Filled : all_rejected ? Outcome::Rejected : manager.successful_cancellations ? Outcome::Cancelled : Outcome::Incomplete;
+        return {task.target, before, after, manager.executed, task.target - manager.executed, manager.account.cash, manager.account.inventory, manager.notional, outcome,
+                manager.submitted_orders, manager.submitted_quantity, manager.local_rejections, manager.exchange_rejections,
+                manager.reservedCash(), manager.reservedInventory(), manager.successful_cancellations, manager.unresolvedOrders()};
     }
     std::string run() {
         const Summary summary = finish();
-        std::ostringstream result; result << "instrument=WHOLE units=whole price/cash=paise time=microseconds zero_fees=1 request_delay_us=" << request_delay << " response_delay_us=" << response_delay << '\n' << eventTrace();
-        result << "SUMMARY side=" << sideText(task.side) << " target=" << summary.target << " deadline_us=" << task.deadline
-               << " by_deadline=" << summary.by_deadline << " late=" << summary.late << " completed=" << summary.completed << " uncompleted=" << summary.uncompleted
-               << " state=" << outcomeText(summary.outcome) << " cash_paise=" << summary.cash << " inventory=" << summary.inventory << " executed_notional_paise=" << summary.notional;
-        if (!summary.completed) result << " average_price_paise=unavailable\n";
-        else result << " average_price_paise=" << summary.notional / summary.completed << " (floor display; exact ratio " << summary.notional << '/' << summary.completed << ")\n";
-        return result.str();
+        std::ostringstream result;
+        result << "instrument=WHOLE units=whole price/cash=paise time=microseconds zero_fees=1 request_delay_us=" << request_delay << " response_delay_us=" << response_delay
+               << " policy=" << (config.kind == PolicyKind::Immediate ? "immediate" : "scheduled") << " slices=" << slices.size() << '\n' << eventTrace();
+        writeSummary(result, summary, task); return result.str();
     }
 };
 inline std::string immediateDemo() {

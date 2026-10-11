@@ -607,3 +607,164 @@ nor historical precision. No threads, services, frontend schema, TWAP, live
 adapter, historical integration, or additional policy is introduced. Executables
 are ignored. Previous historical/backtest/dashboard edits and unrelated artifacts
 are preserved; this milestone does not commit or publish them.
+
+## Milestone B: immediate versus scheduled limit execution
+
+The execution module now supports **multiple orders in one task/account**, while
+retaining Milestone A's immediate purchase and cancellation-race demos. The
+fictional `WHOLE` instrument still uses whole quantities, paise prices/cash, integer
+microseconds, fixed request/response delays, and zero fees. This is a terminal
+experiment; no dashboard, historical feed, or live venue is involved.
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Wpedantic execution_demo.cpp -o execution_demo
+g++ -std=c++17 -Wall -Wextra -Wpedantic execution_tests.cpp -o execution_tests
+g++ -std=c++17 -Wall -Wextra -Wpedantic execution_compare.cpp -o execution_compare
+g++ -std=c++17 -Wall -Wextra -Wpedantic execution_slicing_tests.cpp -o execution_slicing_tests
+./execution_tests
+./execution_slicing_tests
+./execution_demo                     # original A demonstrations
+./execution_compare                  # all three comparisons, three slices
+./execution_compare --scenario rising --trace
+./execution_compare --slices 2 --request-delay-us 2 --response-delay-us 5
+./execution_compare --help
+```
+
+`execution/comparison.h` defines fixed scripts and runs each policy with an
+independent fresh `Experiment`, book, account, ID allocator, and scheduler.
+`execution_compare.cpp` prints the compact table and optional per-order traces.
+No scenario is rewritten after observing which policy filled. External script
+keys are mapped to actual allocated IDs before running, so additional strategy
+orders cannot change cancellation targets. A scripted cancellation of an already
+filled external order produces a deterministic failed-cancel report.
+
+### Policies and ordering
+
+Immediate submits the whole target once at start. Scheduled uses a positive
+slice count `N`, assigning `Q/N` units to every slice and one additional unit to
+the earliest `Q%N` slices. It rejects `N > Q` and windows with fewer than `N`
+integer time units. Slice `i` is delivered at
+`start + floor(i × (deadline-start)/N)` for `i = 0..N-1`. The implementation
+increments quotient/remainder, avoiding an overflowing `i × duration` product.
+For 10 units and 5 slices over `[0,100000)`, quantities are 2 at 0, 20000, 40000,
+60000, and 80000 µs. Nondivisible example: 10 units over `[5,22)` in 3 slices
+submits 4, 3, 3 units at 5, 10, 16 µs.
+
+Each delivered slice submits a bounded limit at the task price; it can cross or
+rest. The policy receives only delivered event kinds, due quantity, and local
+values. It does not inspect exchange state or future external events. Rejected
+slices are recorded and never retried, caught up, repriced, or redistributed.
+Equal submitted slices do **not** guarantee equal executions over time.
+
+Scripts are registered before simulation. Common external events, start, and
+deadline timers retain the same insertion order for both policies; additional
+slice timers follow common timer registration. At equal timestamps, script events
+therefore precede policy timers, and dynamically created same-time requests and
+reports go behind already queued events. Normal book consumption can differ
+between policies. The deadline stops new submissions and requests cancellation
+for **every** order with a potentially executable remainder, including pending
+acknowledgments. Already-requested cancellations are not repeated. Fixed request
+delay preserves each order's submission-before-cancellation arrival. Reports
+continue until all orders settle; exchange occurrence `<= deadline` counts as
+on time, and later execution is late even if cancellation was already requested.
+
+### Per-order tracking and reservation lifecycle
+
+`OrderManager::orders()` provides deterministic ID-ordered records with request
+side/limit/quantity, execution and remaining quantities, acknowledgment/rejection,
+cancellation state, outcome, reason, and own cash/inventory reservation. Task
+aggregates include observed balances, notional, execution, submission/rejection
+counts, and total reservations. The invariant is:
+
+`executed + potentially executable unresolved quantity <= task target`.
+
+Unacknowledged orders and pending cancellations remain exposed. Successfully
+filled orders may still await a cancellation rejection but have zero remaining
+exposure. The old one-order focused tests use `order(id)`; the experiment itself
+has no primary-order assumption.
+
+At **local submission**, buys reserve `limit × quantity` cash; sells reserve
+quantity from inventory. Available resources are observed account balances less
+reservations. Resource shortfalls and target overcommitment produce local
+rejections without sending exchange requests. Invalid shapes/IDs fail clearly.
+All checked products, sums, and representability tests precede resource changes.
+The conservative full-task funding validation from A remains: insufficient
+initial full-task funding rejects every scheduled attempt, rather than attempting
+a smaller underfunded experiment.
+
+A delivered buy fill debits actual notional, adds inventory, and releases
+`limit × filled quantity` from that order. Price improvement becomes available;
+its resting remainder stays reserved. A delivered sell fill credits actual
+proceeds, debits inventory, and releases its filled inventory reservation.
+Only an authoritative rejection or successful cancellation releases an unfilled
+remainder. Requesting cancellation releases nothing; a failed cancellation does
+not release resources by itself. Execution duplicates are ignored without a
+second debit or release, and conflicts fail. Consistent duplicate rejection and
+successful-cancel reports also cannot release twice. Local state never uses
+hidden exchange fills to free resources.
+
+### Hand-checkable default comparisons
+
+Each run buys 6 units at limit 120, starts at 10 µs, has deadline 100 µs, starts
+with 1000 paise/zero inventory, and uses request/response delays 2/5 µs. Scheduled
+uses 3 two-unit slices at 10, 40, 70 µs. Scripted sell liquidity is:
+
+- **Rising:** six at 90 initially; cancel `early` at 35 and submit four at 100;
+  cancel `middle` at 65 and submit two at 110.
+- **Falling:** six at 110 initially; cancel `early` at 35 and submit four at 100;
+  cancel `middle` at 65 and submit two at 90.
+- **Insufficient:** two at 90 initially, one at 100 at 35, and one at 119 at 101.
+  The last event is deliberately after the deadline but before cancellation
+  arrival at 102; no other executable liquidity is supplied.
+
+All executions come from `OrderBook`. An incoming external sell hitting a
+resting strategy buy executes at the **resting buy limit**, not the incoming
+seller's lower price. This explains the insufficient case's later 120-paise
+executions and prevents interpreting the scripted quote as a fabricated fill.
+
+| Scenario / policy | Orders / submitted | On-time / late | Final / uncompleted | Cost · paise | Avg · paise | Final cash / inventory |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Rising / immediate | 1 / 6 | 6 / 0 | 6 / 0 | 540 | 90 | 460 / 6 |
+| Rising / scheduled | 3 / 6 | 6 / 0 | 6 / 0 | 600 | 100 | 400 / 6 |
+| Falling / immediate | 1 / 6 | 6 / 0 | 6 / 0 | 660 | 110 | 340 / 6 |
+| Falling / scheduled | 3 / 6 | 6 / 0 | 6 / 0 | 600 | 100 | 400 / 6 |
+| Insufficient / immediate | 1 / 6 | 3 / 1 | 4 / 2 | 420 | 105 | 580 / 4 |
+| Insufficient / scheduled | 3 / 6 | 3 / 1 | 4 / 2 | 400 | 100 | 600 / 4 |
+
+Default runs have zero local/exchange strategy rejections, unresolved strategy
+orders, reserved cash, and reserved inventory. Both insufficient runs have one
+successful strategy cancellation; the other four have none. External
+cancellations are not counted as strategy cancellations. Every settled run
+requires zero reservations and unresolved orders. The table includes these
+counts explicitly. Submitted quantities count requests actually sent, including
+requests later rejected by the exchange; local failures are separate.
+
+The scheduled insufficient run fills two at 90, one at 100, and one late at the
+resting 120 limit. Immediate fills two at 90 and two at the resting 120 limit.
+Both remain short two units. Compare **completion alongside cost**: unfilled
+quantity is never treated as execution at price zero. Average is actual fill
+notional divided by executed quantity, with an exact ratio and explicitly
+floor-rounded paise display; no fills print N/A. Task summaries distinguish
+filled, cancelled, rejected, and incomplete aggregate outcomes.
+
+### Verification and limits
+
+The eight new slicing test groups cover exact quantities/times (including
+nondivisible and overflow-boundary cases), invalid counts/windows, multiple
+unacknowledged orders, reservation/target boundaries, partials and price
+improvement, rejection/cancellation release, failed-cancel retention, sell-side
+behavior, fill duplicates, multi-order cancellation races, delayed-report deadline
+classification, no-fill/rejected/incomplete results, fixed external cancellation
+mapping, fresh independent runs, hand-calculated scenario results, and
+byte-identical tables/traces. A one-slice scheduled run has the same mechanics
+and trace as immediate. Milestone A's eight test groups and both demos remain
+regressions; their assertions are preserved with per-order accessors and a funded
+local request for the exchange-rejection fixture.
+
+Run the existing engine, simulator, CLI, historical/backtest and frontend tests
+using the commands documented above. No new historical integration is performed;
+existing local-data audits need no download. This milestone adds only controlled
+fixed external flow, fixed delays, zero fees, and one fictional instrument. It
+does not establish predictive performance in real markets, optimal slice counts,
+latency fidelity, or a general execution framework. No historical integration,
+frontend changes, live adapter, threads, or additional policy follows this milestone.

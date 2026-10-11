@@ -24,3 +24,7 @@ historical_backtest_tests
 # Controlled execution experiment executables.
 execution_demo
 execution_tests
+
+# Scheduled execution comparison.
+execution_compare
+execution_slicing_tests
